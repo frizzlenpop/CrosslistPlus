@@ -16,6 +16,7 @@ If you sell on multiple platforms and use [Crosslist](https://crosslist.com) to 
    - [Sync Tab](#sync-tab)
    - [Review Tab](#review-tab)
    - [History Tab](#history-tab)
+   - [Settings](#settings)
 6. [Understanding the Buttons](#understanding-the-buttons)
 7. [Frequently Asked Questions](#frequently-asked-questions)
 8. [Troubleshooting](#troubleshooting)
@@ -142,14 +143,22 @@ This is the main screen where you sync your sold items into Crosslist.
 - Click **"Stop Sync"** at any time to pause. Any items not yet processed will be saved.
 - When you reopen the extension, you'll see a green **"Resume Sync"** button that lets you continue where you left off.
 
+#### Failed items
+
+If some items fail during a sync (no matching listing found, checkbox didn't register, etc.), a red **"Failed Items"** section appears below the counters. Click it to expand and see which items failed and why. You can then use **"Retry Errors"** to re-attempt just those items, or **"Dismiss Errors"** to clear them.
+
+#### Notifications
+
+When a sync completes, you'll receive a Chrome desktop notification showing how many items were synced and how many errors occurred. This is especially useful with auto-sync, so you know when a background sync finishes.
+
 ### Review Tab
 
-This tab is for **cancelled Vinted orders** that need manual review before syncing.
+This tab is for **cancelled orders** from Vinted and/or eBay that need manual review before syncing.
 
 Sometimes orders get cancelled (buyer didn't pay, item was returned, etc.). These items might still be listed on Crosslist and need to be delisted. The Review tab lets you:
 
-1. Click **"Fetch Cancelled Orders"** to pull your cancelled orders from Vinted.
-2. A list of cancelled orders will appear, each with a checkbox.
+1. Click **"Fetch Cancelled Orders"** to pull your cancelled orders from Vinted and/or eBay (depending on which platforms you have enabled).
+2. A list of cancelled orders will appear, each with a platform badge (Vinted or eBay) and a checkbox.
 3. Review the list — uncheck any items you don't want to delist.
 4. Click **"Sync Selected to Crosslist"** to delist the checked items.
 
@@ -164,7 +173,7 @@ Every item that the extension successfully syncs is recorded here. The history s
 - What action was taken (Sold, Delisted, or Sold + Delisted)
 - The date and time
 
-This is useful for keeping track of what's been done. Items in the history are automatically skipped in future syncs, so nothing gets processed twice.
+This is useful for keeping track of what's been done. Items in the history are automatically skipped in future syncs, so nothing gets processed twice. Each title is a clickable link that opens the original item on Vinted or eBay.
 
 You can click **"Clear History"** to wipe the history. Note: if you clear history, those items may be re-processed in future syncs.
 
@@ -179,6 +188,7 @@ You can click **"Clear History"** to wipe the history. Note: if you clear histor
 | **Stop Sync** | Red | Stops the current sync. Items already processed are saved. Remaining items can be resumed later. |
 | **Resume Sync** | Green | Appears after you stop a sync. Picks up where you left off without re-fetching items. |
 | **Retry Errors** | Amber/Orange | Appears after a sync if some items failed (e.g. no matching listing found in Crosslist). Retries only the failed items without re-running the entire sync. |
+| **Dismiss Errors** | Subtle/text | Clears the list of failed items without retrying them. Useful if you've manually resolved them or don't want to retry. |
 
 ---
 
@@ -211,6 +221,13 @@ You can use the **"Retry Errors"** button to try again, or manually mark it in C
 - **Full Sync** fetches everything — all pages of Vinted sold items and all eBay orders across all time periods. It's thorough but slower. Use it for your first sync or occasionally to catch anything that might have been missed.
 
 Both modes skip items that are already in your sync history.
+
+### Settings
+
+At the bottom of the Sync tab, you'll find two optional settings:
+
+- **Auto-sync every 30 min** — When enabled, the extension will automatically run a "Sync Latest" every 30 minutes in the background. It uses your saved Vinted User ID and syncs both platforms. You'll get a notification when it finishes.
+- **Dry Run (preview only)** — When enabled, clicking Sync Latest or Full Sync will fetch your items and show you what *would* happen in the Activity Log, without actually opening Crosslist or making any changes. Useful for checking what's pending before committing to a real sync.
 
 ### The popup closed! Did I lose my progress?
 
