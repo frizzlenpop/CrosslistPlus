@@ -1,0 +1,162 @@
+<!DOCTYPE html>
+<!--
+  CrosslistPlus icon generator.
+  Open this file in Chrome, then click "Download All Icons".
+  Four PNG files will be saved: icon16.png, icon32.png, icon48.png, icon128.png.
+-->
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>CrosslistPlus — Icon Generator</title>
+  <style>
+    body { font-family: sans-serif; padding: 24px; background: #f1f5f9; }
+    h1   { margin: 0 0 8px; font-size: 18px; }
+    p    { color: #475569; margin: 0 0 20px; font-size: 13px; }
+    .previews { display: flex; gap: 24px; align-items: flex-end; flex-wrap: wrap; margin-bottom: 24px; }
+    .preview  { text-align: center; }
+    .preview canvas { display: block; margin: 0 auto 6px;
+                      image-rendering: pixelated;
+                      box-shadow: 0 1px 4px rgba(0,0,0,.25); }
+    .preview span { font-size: 11px; color: #64748b; }
+    button { background: #2563eb; color: #fff; border: none; border-radius: 6px;
+             padding: 10px 20px; font-size: 14px; cursor: pointer; }
+    button:hover { background: #1d4ed8; }
+    .status { margin-top: 12px; font-size: 13px; color: #16a34a; }
+  </style>
+</head>
+<body>
+  <h1>CrosslistPlus — Icon Generator</h1>
+  <p>Previews below. Click the button to download all four PNGs.</p>
+
+  <div class="previews" id="previews"></div>
+
+  <button onclick="downloadAll()">Download All Icons</button>
+  <div class="status" id="status"></div>
+
+  <script>
+  // -------------------------------------------------------------------------
+  // Drawing parameters
+  // -------------------------------------------------------------------------
+  const BG = '#2563eb';
+
+  /**
+   * Draw the sync-arrow icon onto `ctx` at the given `size`.
+   * Two white arcs, each capped with a solid arrowhead.
+   */
+  function drawIcon(ctx, size) {
+    const cx = size / 2;
+    const cy = size / 2;
+    const radius = size / 2 - 0.5;
+
+    // --- Blue disc ---
+    ctx.beginPath();
+    ctx.arc(cx, cy, radius, 0, 2 * Math.PI);
+    ctx.fillStyle = BG;
+    ctx.fill();
+
+    // --- White sync arrows ---
+    const ringR  = radius * 0.52;   // arc centreline radius
+    const lw     = radius * 0.36;   // stroke line-width (thick enough at 16 px)
+    const gapDeg = 28;              // gap between the two arcs (degrees each side)
+    const gap    = gapDeg * Math.PI / 180;
+
+    ctx.strokeStyle = '#ffffff';
+    ctx.fillStyle   = '#ffffff';
+    ctx.lineWidth   = lw;
+    ctx.lineCap     = 'round';
+
+    // Arc 1: gap/2 → π - gap/2  (right half, arrow points downward / clockwise)
+    // Arc 2: π+gap/2 → 2π-gap/2 (left half,  arrow points upward  / clockwise)
+    const arcs = [
+      { start: gap / 2,            end: Math.PI - gap / 2 },
+      { start: Math.PI + gap / 2,  end: 2 * Math.PI - gap / 2 },
+    ];
+
+    const headLen = ringR * 0.62;  // arrowhead height
+    const headW   = lw * 0.90;    // arrowhead half-base
+
+    for (const arc of arcs) {
+      // Draw arc stroke
+      ctx.beginPath();
+      ctx.arc(cx, cy, ringR, arc.start, arc.end);
+      ctx.stroke();
+
+      // Arrowhead at arc.end
+      // Tangent direction at the end angle (CCW travel = angle increases)
+      const tipX = cx + ringR * Math.cos(arc.end);
+      const tipY = cy + ringR * Math.sin(arc.end);
+
+      // Tangent (CCW): (-sin, cos)  →  travel direction at end
+      const tx = -Math.sin(arc.end);
+      const ty =  Math.cos(arc.end);
+      // Normal (left of travel direction)
+      const nx = -ty;
+      const ny =  tx;
+
+      // Base of arrowhead (behind the tip)
+      const bx = tipX - tx * headLen;
+      const by = tipY - ty * headLen;
+
+      ctx.beginPath();
+      ctx.moveTo(tipX, tipY);
+      ctx.lineTo(bx + nx * headW, by + ny * headW);
+      ctx.lineTo(bx - nx * headW, by - ny * headW);
+      ctx.closePath();
+      ctx.fill();
+    }
+
+    // Clip everything to the disc so strokes don't bleed outside
+    ctx.globalCompositeOperation = 'destination-in';
+    ctx.beginPath();
+    ctx.arc(cx, cy, radius, 0, 2 * Math.PI);
+    ctx.fill();
+    ctx.globalCompositeOperation = 'source-over';
+  }
+
+  // -------------------------------------------------------------------------
+  // Build previews
+  // -------------------------------------------------------------------------
+  const SIZES = [16, 32, 48, 128];
+  const canvases = {};
+
+  const container = document.getElementById('previews');
+
+  for (const size of SIZES) {
+    const canvas = document.createElement('canvas');
+    canvas.width  = size;
+    canvas.height = size;
+    // Scale up small icons so they're visible in the preview
+    const display = Math.max(size, 64);
+    canvas.style.width  = display + 'px';
+    canvas.style.height = display + 'px';
+
+    const ctx = canvas.getContext('2d');
+    drawIcon(ctx, size);
+    canvases[size] = canvas;
+
+    const wrap = document.createElement('div');
+    wrap.className = 'preview';
+    wrap.innerHTML = `<span>icon${size}.png<br>(${size}×${size})</span>`;
+    wrap.prepend(canvas);
+    container.appendChild(wrap);
+  }
+
+  // -------------------------------------------------------------------------
+  // Download helper
+  // -------------------------------------------------------------------------
+  function downloadAll() {
+    for (const size of SIZES) {
+      const canvas = canvases[size];
+      const a = document.createElement('a');
+      a.download = `icon${size}.png`;
+      a.href = canvas.toDataURL('image/png');
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+    }
+    document.getElementById('status').textContent =
+      'Downloaded icon16.png, icon32.png, icon48.png, icon128.png — move them into the icons/ folder.';
+  }
+  </script>
+</body>
+</html>

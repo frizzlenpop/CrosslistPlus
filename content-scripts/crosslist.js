@@ -17,6 +17,12 @@
 //     right-click → Inspect the elements and update SELECTORS below.
 // ─────────────────────────────────────────────────────────────────────────────
 
+// Guard against double injection.
+if (window.__crosslistSyncLoaded) {
+    console.log("[InventorySync] Content script already loaded, skipping.");
+} else {
+    window.__crosslistSyncLoaded = true;
+
 const SELECTORS = {
   // The search input on the "My listings" page.
   searchInput: 'input[placeholder*="Search a listing"]',
@@ -161,6 +167,19 @@ function findSoldColumnIndex() {
 }
 
 /**
+ * Find the column index for "Title" by reading the <thead> header row.
+ * Returns a 0-based index, or 3 if not found (hardcoded fallback).
+ */
+function findTitleColumnIndex() {
+  const headers = document.querySelectorAll("table thead th, table thead td");
+  for (let i = 0; i < headers.length; i++) {
+    const text = headers[i].textContent.trim().toLowerCase();
+    if (text === "title") return i;
+  }
+  return 3; // fallback to hardcoded
+}
+
+/**
  * Get the "Sold" checkbox from a table row.
  */
 function getSoldCheckbox(row) {
@@ -193,12 +212,13 @@ function getDelistButton(row) {
 }
 
 /**
- * Read the title text from a row.  Title is typically in the 4th column (index 3).
+ * Read the title text from a row.  Title column is resolved dynamically
+ * from the <thead> header row, falling back to index 3.
  */
 function getRowTitle(row) {
+  const titleIdx = findTitleColumnIndex();
   const cells = row.querySelectorAll("td");
-  // Title column is after: [checkbox, image, SKU, Title, ...]
-  if (cells.length >= 4) return cells[3].textContent.trim();
+  if (titleIdx >= 0 && titleIdx < cells.length) return cells[titleIdx].textContent.trim();
   return "";
 }
 
@@ -207,6 +227,7 @@ function getRowTitle(row) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 let abortSync = false;
+let syncGeneration = 0; // Incremented each time processItems is called
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Notification dismissal — close toasts and lingering dialogs after delist.
@@ -339,47 +360,111 @@ async function performDelist(row) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Pagination helper — tries up to maxPages "next page" clicks to find a row.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Attempt to find a matching row by clicking the "next page" button up to
+ * maxPages times.  Returns the matched row element, or null if not found.
+ *
+ * @param {string} searchTitle - Lowercased title string to match against.
+ * @param {number} [maxPages=3] - Maximum number of additional pages to check.
+ * @returns {Promise<Element|null>}
+ */
+async function tryNextPages(searchTitle, maxPages = 3) {
+  for (let p = 0; p < maxPages; p++) {
+    const nextBtn = document.querySelector('button[aria-label="Next page"], button.p-paginator-next:not([disabled])');
+    if (!nextBtn) return null;
+
+    simulateClick(nextBtn);
+    await sleep(1500);
+
+    const rows = document.querySelectorAll(SELECTORS.listingRow);
+    for (const row of rows) {
+      const rowTitle = getRowTitle(row).toLowerCase();
+      if (rowTitle.includes(searchTitle) || searchTitle.includes(rowTitle)) {
+        return row;
+      }
+    }
+  }
+  return null;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Core sync logic — processes items one-by-one.
 // ─────────────────────────────────────────────────────────────────────────────
 
 async function processItems(items) {
   abortSync = false;
+  syncGeneration++;
+  const myGeneration = syncGeneration;
   let synced = 0;
   let errors = 0;
 
   for (const item of items) {
-    if (abortSync) {
-      report("Sync stopped by user.", "warn");
+    if (abortSync || myGeneration !== syncGeneration) {
+      report("Sync stopped.", "warn");
       break;
     }
 
     try {
       report(`[${item.platform}] Searching for "${item.title}"...`);
 
-      // 1. Type the item title into the Crosslist search bar.
+      // 1. Search by SKU first if available, then fall back to title.
       const searchInput = await waitForElement(SELECTORS.searchInput);
-      await simulateTyping(searchInput, item.title);
-
-      // Wait for the table to filter.
-      await sleep(1500);
-
-      // 2. Find the first matching listing row.
-      const rows = document.querySelectorAll(SELECTORS.listingRow);
+      let searchTerm = item.title;
       let matchedRow = null;
 
-      for (const row of rows) {
-        const rowTitle = getRowTitle(row);
-        if (
-          rowTitle.toLowerCase().includes(item.title.toLowerCase().slice(0, 30))
-        ) {
-          matchedRow = row;
-          break;
+      if (item.sku) {
+        report(`  Trying SKU search: "${item.sku}"...`);
+        await simulateTyping(searchInput, item.sku);
+        await sleep(1500);
+
+        const skuRows = document.querySelectorAll(SELECTORS.listingRow);
+        for (const row of skuRows) {
+          // Check SKU column (index 2) for exact match.
+          const cells = row.querySelectorAll("td");
+          if (cells.length > 2) {
+            const rowSku = cells[2].textContent.trim();
+            if (rowSku === item.sku) {
+              matchedRow = row;
+              break;
+            }
+          }
+        }
+
+        if (!matchedRow && skuRows.length === 1) {
+          matchedRow = skuRows[0]; // Only one result — take it.
+        }
+
+        if (!matchedRow) {
+          report(`  SKU not found, falling back to title search...`);
+          await clearSearch(searchInput);
         }
       }
 
-      // If no exact match, take the first row (search already filtered).
-      if (!matchedRow && rows.length > 0) {
-        matchedRow = rows[0];
+      if (!matchedRow) {
+        await simulateTyping(searchInput, item.title);
+        await sleep(1500);
+
+        const rows = document.querySelectorAll(SELECTORS.listingRow);
+        for (const row of rows) {
+          const rowTitle = getRowTitle(row).toLowerCase();
+          const searchTitle = item.title.toLowerCase();
+          if (rowTitle.includes(searchTitle) || searchTitle.includes(rowTitle)) {
+            matchedRow = row;
+            break;
+          }
+        }
+
+        if (!matchedRow && rows.length > 0) {
+          matchedRow = rows[0];
+        }
+      }
+
+      // If still no match, try paginating through additional result pages.
+      if (!matchedRow) {
+        matchedRow = await tryNextPages(item.title.toLowerCase());
       }
 
       if (!matchedRow) {
@@ -426,8 +511,9 @@ async function processItems(items) {
         let freshRow = matchedRow;
         const freshRows = document.querySelectorAll(SELECTORS.listingRow);
         for (const r of freshRows) {
-          const t = getRowTitle(r);
-          if (t.toLowerCase().includes(item.title.toLowerCase().slice(0, 30))) {
+          const t = getRowTitle(r).toLowerCase();
+          const searchTitle = item.title.toLowerCase();
+          if (t.includes(searchTitle) || searchTitle.includes(t)) {
             freshRow = r;
             break;
           }
@@ -543,3 +629,5 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
 });
 
 console.log("[InventorySync] Crosslist content script loaded.");
+
+} // end of double-injection guard

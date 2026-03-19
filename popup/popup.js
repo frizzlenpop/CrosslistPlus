@@ -7,6 +7,7 @@ const btnFullSync = $("#btn-full-sync");
 const btnStop     = $("#btn-stop");
 const btnResume   = $("#btn-resume");
 const btnRetry    = $("#btn-retry");
+const btnDismissErrors = $("#btn-dismiss-errors");
 const countFound  = $("#count-found");
 const countSynced = $("#count-synced");
 const countErrors = $("#count-errors");
@@ -21,6 +22,10 @@ const cancelledList    = $("#cancelled-list");
 const reviewFooter     = $("#review-footer");
 const chkSelectAll     = $("#chk-select-all");
 const btnSyncCancelled = $("#btn-sync-cancelled");
+const errorsSection    = $("#errors-section");
+const errorsToggle     = $("#errors-toggle");
+const errorsList       = $("#errors-list");
+const errorsCountBadge = $("#errors-count-badge");
 
 // ── Logging helpers ──────────────────────────────────────────────────────────
 
@@ -44,7 +49,7 @@ function clearLogs() {
 document.querySelectorAll(".platform-toggle").forEach((toggle) => {
   toggle.addEventListener("click", () => {
     const cb = toggle.querySelector("input[type=checkbox]");
-    cb.checked = !cb.checked;
+    // Native label click already toggles cb.checked — just sync the class.
     toggle.classList.toggle("active", cb.checked);
   });
 });
@@ -58,6 +63,49 @@ chrome.storage.local.get(["vintedUserId"], (data) => {
 vintedIdInput.addEventListener("change", () => {
   chrome.storage.local.set({ vintedUserId: vintedIdInput.value.trim() });
 });
+
+// ── Auto-sync toggle ────────────────────────────────────────────────────────
+
+const chkAutoSync = $("#chk-auto-sync");
+
+chrome.storage.local.get({ autoSync: false }, (data) => {
+  chkAutoSync.checked = data.autoSync;
+});
+
+chkAutoSync.addEventListener("change", () => {
+  chrome.storage.local.set({ autoSync: chkAutoSync.checked });
+});
+
+// ── Dry-run toggle ──────────────────────────────────────────────────────────
+
+const chkDryRun = $("#chk-dry-run");
+
+// ── Errored items: toggle expand/collapse ────────────────────────────────────
+
+errorsToggle.addEventListener("click", () => {
+  errorsToggle.classList.toggle("expanded");
+  errorsList.style.display = errorsToggle.classList.contains("expanded") ? "block" : "none";
+});
+
+// ── Errored items: render list ───────────────────────────────────────────────
+
+function renderErroredItems(items) {
+  if (!items || items.length === 0) {
+    errorsSection.style.display = "none";
+    return;
+  }
+  errorsSection.style.display = "block";
+  errorsCountBadge.textContent = items.length;
+  errorsList.innerHTML = "";
+  for (const item of items) {
+    const div = document.createElement("div");
+    div.className = "error-item";
+    div.innerHTML =
+      `<span class="e-platform ${esc(item.platform)}">${esc(item.platform)}</span>` +
+      `<span class="e-title" title="${esc(item.title)}">${esc(item.title)}</span>`;
+    errorsList.appendChild(div);
+  }
+}
 
 // ── Restore sync state from previous session ─────────────────────────────────
 // The popup closes whenever the user switches tabs (e.g. to Crosslist).
@@ -99,6 +147,16 @@ chrome.runtime.sendMessage({ type: "get-sync-state" }, (state) => {
   if (!state.running && state.erroredItems && state.erroredItems.length > 0) {
     btnRetry.textContent = `Retry Errors (${state.erroredItems.length})`;
     btnRetry.style.display = "block";
+    btnDismissErrors.style.display = "block";
+  }
+
+  // Render errored items list.
+  renderErroredItems(state.erroredItems);
+
+  // Show primary sync buttons if sync is not running.
+  if (!state.running) {
+    btnSync.style.display = "";
+    btnFullSync.style.display = "";
   }
 });
 
@@ -107,6 +165,11 @@ chrome.runtime.sendMessage({ type: "get-sync-state" }, (state) => {
 chrome.runtime.onMessage.addListener((msg) => {
   if (msg.type === "sync-log") {
     log(msg.text, msg.level || "info");
+  }
+  if (msg.type === "sync-history-entry") {
+    if (historyView.style.display !== "none") {
+      renderHistory();
+    }
   }
   if (msg.type === "sync-counts") {
     countFound.textContent  = msg.found  ?? countFound.textContent;
@@ -145,15 +208,18 @@ chrome.runtime.onMessage.addListener((msg) => {
       });
     }
 
-    // Show retry button if there are errored items.
+    // Show retry button and errored items list if there are errored items.
     chrome.runtime.sendMessage({ type: "get-sync-state" }, (state) => {
       if (chrome.runtime.lastError || !state) return;
       if (state.erroredItems && state.erroredItems.length > 0) {
         btnRetry.textContent = `Retry Errors (${state.erroredItems.length})`;
         btnRetry.style.display = "block";
+        btnDismissErrors.style.display = "block";
       } else {
         btnRetry.style.display = "none";
+        btnDismissErrors.style.display = "none";
       }
+      renderErroredItems(state.erroredItems);
     });
   }
 });
@@ -162,6 +228,7 @@ chrome.runtime.onMessage.addListener((msg) => {
 
 function startSync(mode) {
   clearLogs();
+  errorsSection.style.display = "none";
 
   const enableVinted = $('[data-platform="vinted"]').classList.contains("active");
   const enableEbay   = $('[data-platform="ebay"]').classList.contains("active");
@@ -177,6 +244,11 @@ function startSync(mode) {
     return;
   }
 
+  if (enableVinted && vintedUserId && !/^\d+$/.test(vintedUserId)) {
+    log("Vinted User ID must be a number (e.g. 123456789).", "warn");
+    return;
+  }
+
   // Save the ID for next time.
   chrome.storage.local.set({ vintedUserId });
 
@@ -184,13 +256,20 @@ function startSync(mode) {
   btnFullSync.style.display = "none";
   btnResume.style.display = "none";
   btnRetry.style.display = "none";
+  btnDismissErrors.style.display = "none";
   btnStop.style.display = "block";
-  log(mode === "full" ? "Starting full sync..." : "Starting sync (latest)...");
+  const dryRun = chkDryRun.checked;
+  log(
+    dryRun
+      ? (mode === "full" ? "Starting full sync (DRY RUN)..." : "Starting sync — latest (DRY RUN)...")
+      : (mode === "full" ? "Starting full sync..." : "Starting sync (latest)...")
+  );
 
   // Tell the service worker to begin.
   chrome.runtime.sendMessage({
     type: "start-sync",
     mode,
+    dryRun,
     platforms: {
       vinted: enableVinted,
       ebay: enableEbay,
@@ -217,6 +296,7 @@ btnResume.addEventListener("click", () => {
   clearLogs();
   btnResume.style.display = "none";
   btnRetry.style.display = "none";
+  btnDismissErrors.style.display = "none";
   btnSync.style.display = "none";
   btnFullSync.style.display = "none";
   btnStop.style.display = "block";
@@ -228,13 +308,24 @@ btnResume.addEventListener("click", () => {
 
 btnRetry.addEventListener("click", () => {
   clearLogs();
+  errorsSection.style.display = "none";
   btnRetry.style.display = "none";
+  btnDismissErrors.style.display = "none";
   btnResume.style.display = "none";
   btnSync.style.display = "none";
   btnFullSync.style.display = "none";
   btnStop.style.display = "block";
   log("Retrying errored items...");
   chrome.runtime.sendMessage({ type: "retry-errors" });
+});
+
+// ── Dismiss errors button click handler ─────────────────────────────────────
+
+btnDismissErrors.addEventListener("click", () => {
+  chrome.runtime.sendMessage({ type: "clear-errors" });
+  btnRetry.style.display = "none";
+  btnDismissErrors.style.display = "none";
+  errorsSection.style.display = "none";
 });
 
 // ── Tab switching ────────────────────────────────────────────────────────────
@@ -279,6 +370,23 @@ function esc(str) {
   return d.innerHTML;
 }
 
+/**
+ * Returns the platform-specific URL for a synced item.
+ * @param {string} platform - "vinted" or "ebay"
+ * @param {string} id - item ID (Vinted IDs may carry an "order_" prefix)
+ * @returns {string}
+ */
+function itemUrl(platform, id) {
+  if (platform === "vinted") {
+    const cleanId = id.startsWith("order_") ? id.slice(6) : id;
+    return `https://www.vinted.co.uk/items/${cleanId}`;
+  }
+  if (platform === "ebay") {
+    return `https://www.ebay.co.uk/itm/${id}`;
+  }
+  return "#";
+}
+
 function renderHistory() {
   chrome.storage.local.get({ syncHistory: [] }, (data) => {
     const history = data.syncHistory;
@@ -298,7 +406,7 @@ function renderHistory() {
       div.innerHTML =
         `<span class="h-platform ${esc(e.platform)}">${esc(e.platform)}</span>` +
         `<div class="h-body">` +
-          `<div class="h-title" title="${title}">${title}</div>` +
+          `<div class="h-title" title="${title}"><a href="${itemUrl(e.platform, e.id)}" target="_blank">${title}</a></div>` +
           `<div class="h-meta">${formatDate(e.timestamp)}</div>` +
         `</div>` +
         `<span class="h-action ${actionClass(e.action)}">${actionLabel(e.action)}</span>`;
@@ -320,12 +428,17 @@ btnClearHistory.addEventListener("click", () => {
 let cancelledOrders = []; // Cached list from last fetch.
 
 btnFetchCancelled.addEventListener("click", () => {
+  const enableVinted = document.querySelector('[data-platform="vinted"]').classList.contains("active");
+  const enableEbay = document.querySelector('[data-platform="ebay"]').classList.contains("active");
+
   btnFetchCancelled.disabled = true;
   btnFetchCancelled.textContent = "Fetching...";
   cancelledList.innerHTML = '<div class="cancelled-empty">Loading cancelled orders...</div>';
   reviewFooter.style.display = "none";
 
-  chrome.runtime.sendMessage({ type: "fetch-cancelled" }, (response) => {
+  chrome.runtime.sendMessage(
+    { type: "fetch-cancelled", platforms: { vinted: enableVinted, ebay: enableEbay } },
+    (response) => {
     btnFetchCancelled.disabled = false;
     btnFetchCancelled.textContent = "Fetch Cancelled Orders";
 
@@ -351,6 +464,11 @@ function renderCancelledOrders() {
     const card = document.createElement("div");
     card.className = "cancelled-card selected";
     card.dataset.transactionId = order.transaction_id;
+
+    const platformName = order.source || "vinted";
+    const platformLabel = document.createElement("span");
+    platformLabel.className = `review-platform ${platformName}`;
+    platformLabel.textContent = platformName;
 
     const thumb = document.createElement("img");
     thumb.className = "thumb";
@@ -383,6 +501,7 @@ function renderCancelledOrders() {
       updateSyncButtonCount();
     });
 
+    card.appendChild(platformLabel);
     card.appendChild(thumb);
     card.appendChild(info);
     card.appendChild(checkbox);
@@ -433,11 +552,11 @@ btnSyncCancelled.addEventListener("click", () => {
     const order = cancelledOrders.find((o) => String(o.transaction_id) === tid);
     if (order) {
       items.push({
-        platform: "vinted",
+        platform: order.source || "vinted",
         id: String(order.transaction_id),
         title: order.title,
-        sku: "",
-        status: "sold", // Mark as sold so Crosslist marks sold + delists.
+        sku: order.sku || "",
+        status: "canceled", // Delist from Crosslist (sale was cancelled).
       });
     }
   }
@@ -460,5 +579,6 @@ btnSyncCancelled.addEventListener("click", () => {
   btnFullSync.style.display = "none";
   btnResume.style.display = "none";
   btnRetry.style.display = "none";
+  btnDismissErrors.style.display = "none";
   btnStop.style.display = "block";
 });

@@ -201,6 +201,23 @@
     }
     #btn-retry:hover { background: #b45309; }
 
+    /* ── Dismiss Errors Button ────────────────────────── */
+    #btn-dismiss-errors {
+      width: 100%;
+      padding: 6px;
+      background: transparent;
+      color: #8b8fa3;
+      font-size: 12px;
+      font-weight: 500;
+      border: 1px solid #2a2d3a;
+      border-radius: 6px;
+      cursor: pointer;
+      transition: color 0.2s;
+      margin-bottom: 8px;
+      display: none;
+    }
+    #btn-dismiss-errors:hover { color: #e2e4e9; }
+
     /* ── Summary Bar ──────────────────────────────────── */
     .summary {
       display: flex;
@@ -351,6 +368,16 @@
     .h-action.delisted      { color: #eab308; }
     .h-action.sold-delisted { color: #3b82f6; }
 
+    .history-entry .h-title a {
+      color: #e2e4e9;
+      text-decoration: none;
+      transition: color 0.2s;
+    }
+    .history-entry .h-title a:hover {
+      color: #60a5fa;
+      text-decoration: underline;
+    }
+
     #btn-clear-history {
       width: 100%;
       padding: 10px;
@@ -405,6 +432,7 @@
     }
 
     .cancelled-card {
+      position: relative;
       display: flex;
       align-items: center;
       gap: 10px;
@@ -418,6 +446,17 @@
     }
     .cancelled-card:hover { border-color: #3b3f52; }
     .cancelled-card.selected { border-color: #2563eb; background: #1a1d35; }
+
+    .review-platform {
+      font-size: 9px;
+      font-weight: 600;
+      text-transform: uppercase;
+      padding: 2px 6px;
+      border-radius: 9999px;
+      flex-shrink: 0;
+    }
+    .review-platform.vinted { background: #00645a; color: #5eead4; }
+    .review-platform.ebay   { background: #713f12; color: #fbbf24; }
 
     .cancelled-card .thumb {
       width: 48px;
@@ -505,6 +544,73 @@
       border-radius: 9999px;
       margin-left: 4px;
     }
+
+    /* ── Errored Items Section ────────────────────────── */
+    .errors-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      background: #1a1d27;
+      border: 1px solid #2a2d3a;
+      border-radius: 8px;
+      padding: 10px 14px;
+      margin-bottom: 8px;
+      cursor: pointer;
+      font-size: 12px;
+      color: #ef4444;
+    }
+    .errors-count {
+      background: #7f1d1d;
+      color: #fca5a5;
+      padding: 1px 7px;
+      border-radius: 9999px;
+      font-size: 11px;
+    }
+    .errors-chevron {
+      transition: transform 0.2s;
+    }
+    .errors-header.expanded .errors-chevron {
+      transform: rotate(180deg);
+    }
+    .errors-list {
+      max-height: 150px;
+      overflow-y: auto;
+      margin-bottom: 12px;
+      display: none;
+    }
+    .errors-list::-webkit-scrollbar { width: 4px; }
+    .errors-list::-webkit-scrollbar-track { background: transparent; }
+    .errors-list::-webkit-scrollbar-thumb { background: #2a2d3a; border-radius: 4px; }
+    .error-item {
+      background: #1a1d27;
+      border: 1px solid #2a2d3a;
+      border-radius: 6px;
+      padding: 8px 12px;
+      margin-bottom: 4px;
+      font-size: 12px;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .error-item .e-title {
+      color: #e2e4e9;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      flex: 1;
+      min-width: 0;
+    }
+    .error-item .e-platform {
+      font-size: 10px;
+      font-weight: 600;
+      text-transform: uppercase;
+      padding: 2px 8px;
+      border-radius: 9999px;
+      display: inline-block;
+      flex-shrink: 0;
+    }
+    .e-platform.vinted { background: #00645a; color: #5eead4; }
+    .e-platform.ebay   { background: #713f12; color: #fbbf24; }
   </style>
 </head>
 <body>
@@ -546,11 +652,26 @@
     <div class="hint">Profile → URL contains your numeric user ID</div>
   </div>
 
+  <!-- Settings toggles -->
+  <div class="config-section" style="padding: 10px 14px; margin-bottom: 12px;">
+    <label style="display:flex; align-items:center; gap:8px; cursor:pointer; margin-bottom:8px; text-transform:none; letter-spacing:normal; font-size:13px; color:#e2e4e9;">
+      <input type="checkbox" id="chk-auto-sync" style="accent-color:#2563eb; width:16px; height:16px;" />
+      Auto-sync every 30 minutes
+    </label>
+    <div class="hint" style="margin-top:0; margin-bottom:10px; margin-left:24px;">Runs in the background — syncs latest items automatically.</div>
+    <label style="display:flex; align-items:center; gap:8px; cursor:pointer; margin-bottom:0; text-transform:none; letter-spacing:normal; font-size:13px; color:#e2e4e9;">
+      <input type="checkbox" id="chk-dry-run" style="accent-color:#eab308; width:16px; height:16px;" />
+      Dry run (preview only)
+    </label>
+    <div class="hint" style="margin-top:4px; margin-left:24px;">Shows what would be synced without making changes.</div>
+  </div>
+
   <!-- Sync Buttons -->
   <button id="btn-resume">Resume Sync</button>
-  <button id="btn-retry">Retry Errors</button>
-  <button id="btn-sync">Sync Latest</button>
-  <button id="btn-full-sync">Full Sync</button>
+  <button id="btn-retry" title="Re-attempts only the items that failed in the last sync">Retry Errors</button>
+  <button id="btn-dismiss-errors">Dismiss Errors</button>
+  <button id="btn-sync" style="display:none" title="Fetches recent items (last page from Vinted, last 90 days from eBay)">Sync Latest</button>
+  <button id="btn-full-sync" style="display:none" title="Fetches all sold items across all time periods — slower but thorough">Full Sync</button>
   <button id="btn-stop">Stop Sync</button>
 
   <!-- Summary Counters -->
@@ -569,6 +690,16 @@
     </div>
   </div>
 
+  <!-- Errored Items -->
+  <div id="errors-section" style="display:none">
+    <div class="errors-header" id="errors-toggle">
+      <span>Failed Items</span>
+      <span class="errors-count" id="errors-count-badge">0</span>
+      <span class="errors-chevron">&#9660;</span>
+    </div>
+    <div id="errors-list" class="errors-list"></div>
+  </div>
+
   <!-- Log Output -->
   <div class="log-header">Activity Log</div>
   <div id="logs"></div>
@@ -579,7 +710,7 @@
   <div id="review-view">
     <button id="btn-fetch-cancelled">Fetch Cancelled Orders</button>
     <div id="cancelled-list">
-      <div class="cancelled-empty">Click above to fetch cancelled Vinted orders for review.</div>
+      <div class="cancelled-empty">Fetch your cancelled orders to review and selectively delist from Crosslist.</div>
     </div>
     <div class="review-footer" style="display:none" id="review-footer">
       <label class="select-all-label">

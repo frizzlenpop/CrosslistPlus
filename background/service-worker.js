@@ -240,7 +240,7 @@ async function fetchVintedSales(userId, latestOnly = false) {
 // Does NOT require userId — uses the logged-in session cookie.
 // ─────────────────────────────────────────────────────────────────────────────
 
-async function fetchVintedCancelled() {
+async function fetchVintedCancelled(latestOnly = true) {
   const domains = [
     "www.vinted.co.uk",
     "www.vinted.com",
@@ -248,6 +248,7 @@ async function fetchVintedCancelled() {
     "www.vinted.de",
   ];
 
+  const maxPages = latestOnly ? 1 : Infinity;
   let items = [];
 
   for (const domain of domains) {
@@ -255,7 +256,7 @@ async function fetchVintedCancelled() {
       let page = 1;
       let totalPages = 1;
 
-      while (page <= totalPages) {
+      while (page <= totalPages && page <= maxPages) {
         const url =
           `https://${domain}/api/v2/my_orders` +
           `?type=sold&status=canceled&per_page=50&page=${page}`;
@@ -294,6 +295,59 @@ async function fetchVintedCancelled() {
   }
 
   return items;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// EBAY — Fetch cancelled orders for manual review
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// Navigates to /sh/ord/cancel and scrapes the cancellation table via the
+// existing scrapeEbayOrdersFromTab helper.  Returns items in the same shape
+// as fetchVintedCancelled so the fetch-cancelled handler can merge them.
+// ─────────────────────────────────────────────────────────────────────────────
+
+async function fetchEbayCancelled() {
+  const domains = ["www.ebay.co.uk", "www.ebay.com"];
+
+  let tabId = null;
+  let usedDomain = null;
+
+  // Re-use an existing eBay Seller Hub tab if one is already open.
+  for (const domain of domains) {
+    const tabs = await chrome.tabs.query({ url: `*://${domain}/sh/ord*` });
+    if (tabs.length > 0) {
+      tabId = tabs[0].id;
+      usedDomain = domain;
+      break;
+    }
+  }
+
+  if (!tabId) {
+    usedDomain = domains[0];
+    const newTab = await chrome.tabs.create({
+      url: `https://${usedDomain}/sh/ord/cancel`,
+      active: false,
+    });
+    tabId = newTab.id;
+    await waitForTabLoad(tabId);
+  }
+
+  try {
+    const items = await scrapeEbayOrdersFromTab(tabId, usedDomain, "/sh/ord/cancel", "canceled");
+    // Normalize to the same shape fetchVintedCancelled returns so the
+    // fetch-cancelled handler can merge the two arrays transparently.
+    return items.map((item) => ({
+      transaction_id: item.id,
+      title: item.title,
+      price: "",
+      status: "Cancelled",
+      date: new Date().toISOString(),
+      photoUrl: "",
+      source: "ebay",
+    }));
+  } catch (err) {
+    return [];
+  }
 }
 
 /**
@@ -351,19 +405,8 @@ async function fetchEbaySales(latestOnly = false) {
   }
 
   if (!tabId) {
-    // No Seller Hub tab open — try to find any eBay tab we can navigate.
-    for (const domain of domains) {
-      const tabs = await chrome.tabs.query({ url: `*://${domain}/*` });
-      if (tabs.length > 0) {
-        tabId = tabs[0].id;
-        usedDomain = domain;
-        break;
-      }
-    }
-  }
-
-  if (!tabId) {
-    // No eBay tab at all — open one.
+    // No Seller Hub tab open — open a new background tab instead of
+    // hijacking the user's existing eBay browsing tab.
     usedDomain = domains[0];
     const newTab = await chrome.tabs.create({
       url: `https://${usedDomain}/sh/ord/?filter=status:ALL_ORDERS`,
@@ -388,11 +431,11 @@ async function fetchEbaySales(latestOnly = false) {
         "sold"
       );
     } else {
-      const endDate = Date.now() + 86400000; // tomorrow in ms
+      const endDate = Math.floor((Date.now() + 86400000) / 1000); // tomorrow in seconds
       soldItems = await scrapeEbayAllPages(
         tabId,
         usedDomain,
-        `status:ALL_ORDERS,timerange:CUSTOM&startDate=0&endDate=${endDate}`,
+        `status:ALL_ORDERS,timerange:CUSTOM,startDate:0,endDate:${endDate}`,
         "sold"
       );
     }
@@ -537,16 +580,34 @@ function scrapeEbayOrdersDOM(defaultStatus) {
 
 /**
  * Wait for a tab to finish loading.
+ * Checks current tab status first to avoid hanging if already loaded.
+ * @param {number} tabId
+ * @param {number} [timeout=30000]
+ * @returns {Promise<void>}
  */
-function waitForTabLoad(tabId) {
-  return new Promise((resolve) => {
-    const listener = (id, info) => {
-      if (id === tabId && info.status === "complete") {
-        chrome.tabs.onUpdated.removeListener(listener);
+function waitForTabLoad(tabId, timeout = 30000) {
+  return new Promise((resolve, reject) => {
+    // Check if the tab is already loaded.
+    chrome.tabs.get(tabId, (tab) => {
+      if (tab && tab.status === "complete") {
         resolve();
+        return;
       }
-    };
-    chrome.tabs.onUpdated.addListener(listener);
+
+      const timer = setTimeout(() => {
+        chrome.tabs.onUpdated.removeListener(listener);
+        reject(new Error(`Tab ${tabId} did not finish loading within ${timeout}ms`));
+      }, timeout);
+
+      const listener = (id, info) => {
+        if (id === tabId && info.status === "complete") {
+          clearTimeout(timer);
+          chrome.tabs.onUpdated.removeListener(listener);
+          resolve();
+        }
+      };
+      chrome.tabs.onUpdated.addListener(listener);
+    });
   });
 }
 
@@ -570,8 +631,21 @@ function dedup(items) {
 // If no Crosslist tab is open, we inject the content script into a new one.
 // ─────────────────────────────────────────────────────────────────────────────
 
-async function sendToCrosslist(items) {
-  emitLog(`Sending ${items.length} item(s) to Crosslist...`);
+async function sendToCrosslist(items, dryRun = false) {
+  emitLog(`Sending ${items.length} item(s) to Crosslist${dryRun ? " (DRY RUN)" : ""}...`);
+
+  if (dryRun) {
+    // In dry-run mode, just log what would happen without opening Crosslist.
+    for (const item of items) {
+      emitLog(`  [DRY RUN] Would process: [${item.platform}] "${item.title}" → ${item.status}`);
+    }
+    emitCounts({ found: items.length, synced: items.length, errors: 0 });
+    emitLog(`Dry run complete: ${items.length} item(s) would be processed.`, "ok");
+    syncState.running = false;
+    saveNow();
+    chrome.runtime.sendMessage({ type: "sync-done", completed: true }).catch(() => {});
+    return;
+  }
 
   // Find an existing Crosslist tab.
   const tabs = await chrome.tabs.query({ url: "*://app.crosslist.com/*" });
@@ -608,100 +682,6 @@ async function sendToCrosslist(items) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Main listener — orchestrates the full sync when triggered by the popup.
-// ─────────────────────────────────────────────────────────────────────────────
-
-chrome.runtime.onMessage.addListener((msg, _sender, _sendResponse) => {
-  if (msg.type !== "start-sync") return;
-
-  (async () => {
-    await stateReady;
-    try {
-      // Reset sync state for a fresh sync.
-      syncState = { running: true, found: 0, synced: 0, errors: 0, logs: [], pendingItems: [], erroredItems: [] };
-      saveNow();
-
-      const { platforms, vintedUserId, mode } = msg;
-      const latestOnly = mode !== "full";
-      let allItems = [];
-
-      // 1. Fetch from enabled platforms in parallel.
-      const jobs = [];
-      if (platforms.vinted) jobs.push(fetchVintedSales(vintedUserId, latestOnly));
-      if (platforms.ebay)   jobs.push(fetchEbaySales(latestOnly));
-
-      const results = await Promise.allSettled(jobs);
-      for (const r of results) {
-        if (r.status === "fulfilled") allItems.push(...r.value);
-      }
-
-      allItems = dedup(allItems);
-      emitCounts({ found: allItems.length });
-      emitLog(`Total unique items: ${allItems.length}`);
-
-      if (allItems.length === 0) {
-        emitLog("Nothing to sync.", "warn");
-        syncState.running = false;
-        saveNow();
-        chrome.runtime.sendMessage({ type: "sync-done", completed: true }).catch(() => {});
-        return;
-      }
-
-      // 2. Filter out items already in sync history.
-      const { syncHistory = [] } = await chrome.storage.local.get({ syncHistory: [] });
-      const historyKeys = new Set(syncHistory.map((e) => `${e.platform}:${e.id}`));
-      const newItems = allItems.filter((i) => !historyKeys.has(`${i.platform}:${i.id}`));
-      const skipped = allItems.length - newItems.length;
-
-      if (skipped > 0) {
-        emitLog(`Skipped ${skipped} item(s) already synced.`, "info");
-      }
-
-      if (newItems.length === 0) {
-        emitLog("All items already synced. Nothing to do.", "ok");
-        syncState.running = false;
-        saveNow();
-        chrome.runtime.sendMessage({ type: "sync-done", completed: true }).catch(() => {});
-        return;
-      }
-
-      // Store pending items for resume capability.
-      syncState.pendingItems = newItems;
-      saveNow();
-      emitLog(`${newItems.length} item(s) to process.`);
-
-      // 3. Forward to Crosslist.
-      await sendToCrosslist(newItems);
-
-      // The content script will send "sync-done" when it finishes processing.
-
-    } catch (err) {
-      emitLog(`Fatal error: ${err.message}`, "error");
-      syncState.running = false;
-      saveNow();
-      chrome.runtime.sendMessage({ type: "sync-done", completed: false }).catch(() => {});
-    }
-  })();
-
-  return true;
-});
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Forward "stop-sync" from the popup to the Crosslist content script.
-// ─────────────────────────────────────────────────────────────────────────────
-
-chrome.runtime.onMessage.addListener((msg) => {
-  if (msg.type !== "stop-sync") return;
-
-  // Forward to all Crosslist tabs.
-  chrome.tabs.query({ url: "*://app.crosslist.com/*" }, (tabs) => {
-    for (const tab of tabs) {
-      chrome.tabs.sendMessage(tab.id, { type: "stop-sync" }).catch(() => {});
-    }
-  });
-});
-
-// ─────────────────────────────────────────────────────────────────────────────
 // Persist sync history entries from the Crosslist content script.
 // Each entry: { platform, id, title, status, action, timestamp }
 // Capped at 500 entries (FIFO — oldest dropped first).
@@ -709,190 +689,13 @@ chrome.runtime.onMessage.addListener((msg) => {
 
 const HISTORY_CAP = 500;
 
-chrome.runtime.onMessage.addListener((msg, _sender, _sendResponse) => {
-  if (msg.type !== "sync-history-entry") return;
-
-  const entry = msg.entry;
-  if (!entry) return;
-
-  chrome.storage.local.get({ syncHistory: [] }, (data) => {
-    const history = data.syncHistory;
-    history.push(entry);
-    // Trim oldest entries if over cap.
-    if (history.length > HISTORY_CAP) {
-      history.splice(0, history.length - HISTORY_CAP);
-    }
-    chrome.storage.local.set({ syncHistory: history });
-  });
-});
-
 // ─────────────────────────────────────────────────────────────────────────────
-// Track errored items so the user can retry just the failures.
-// ─────────────────────────────────────────────────────────────────────────────
-
-chrome.runtime.onMessage.addListener((msg) => {
-  if (msg.type !== "sync-error-entry") return;
-  if (!msg.item) return;
-
-  // Deduplicate — don't add the same item twice.
-  const key = `${msg.item.platform}:${msg.item.id}`;
-  const already = syncState.erroredItems.some(
-    (i) => `${i.platform}:${i.id}` === key
-  );
-  if (!already) {
-    syncState.erroredItems.push(msg.item);
-    scheduleSave();
-  }
-});
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Retry only the errored items — same flow as sync-manual-items.
-// ─────────────────────────────────────────────────────────────────────────────
-
-chrome.runtime.onMessage.addListener((msg) => {
-  if (msg.type !== "retry-errors") return;
-
-  (async () => {
-    await stateReady;
-    try {
-      const items = syncState.erroredItems || [];
-      if (items.length === 0) {
-        emitLog("No errored items to retry.", "warn");
-        syncState.running = false;
-        saveNow();
-        chrome.runtime.sendMessage({ type: "sync-done", completed: true }).catch(() => {});
-        return;
-      }
-
-      // Filter out items that were manually resolved (now in syncHistory).
-      const { syncHistory = [] } = await chrome.storage.local.get({ syncHistory: [] });
-      const historyKeys = new Set(syncHistory.map((e) => `${e.platform}:${e.id}`));
-      const remaining = items.filter((i) => !historyKeys.has(`${i.platform}:${i.id}`));
-
-      // Reset sync state — clear erroredItems (they'll be re-added if they fail again).
-      syncState = {
-        running: true,
-        found: 0,
-        synced: 0,
-        errors: 0,
-        logs: [],
-        pendingItems: remaining,
-        erroredItems: [],
-      };
-      saveNow();
-
-      if (remaining.length === 0) {
-        emitLog("All errored items have since been resolved.", "ok");
-        syncState.running = false;
-        saveNow();
-        chrome.runtime.sendMessage({ type: "sync-done", completed: true }).catch(() => {});
-        return;
-      }
-
-      emitCounts({ found: remaining.length, synced: 0, errors: 0 });
-      emitLog(`Retrying ${remaining.length} errored item(s)...`);
-      await sendToCrosslist(remaining);
-    } catch (err) {
-      emitLog(`Retry error: ${err.message}`, "error");
-      syncState.running = false;
-      saveNow();
-      chrome.runtime.sendMessage({ type: "sync-done", completed: false }).catch(() => {});
-    }
-  })();
-
-  return true;
-});
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Fetch cancelled orders for manual review in the popup.
-// Returns items filtered against syncHistory so already-synced items are excluded.
+// Consolidated message listener — handles ALL messages from popup and content
+// scripts in one place to avoid listener ordering and return-value conflicts.
 // ─────────────────────────────────────────────────────────────────────────────
 
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
-  if (msg.type !== "fetch-cancelled") return;
-
-  (async () => {
-    try {
-      const items = await fetchVintedCancelled();
-
-      // Filter out items already in sync history.
-      const { syncHistory = [] } = await chrome.storage.local.get({ syncHistory: [] });
-      const historyKeys = new Set(syncHistory.map((e) => `${e.platform}:${e.id}`));
-      const newItems = items.filter((i) => !historyKeys.has(`vinted:${i.transaction_id}`));
-
-      sendResponse({ items: newItems });
-    } catch (err) {
-      sendResponse({ items: [], error: err.message });
-    }
-  })();
-
-  return true; // Keep message channel open for async sendResponse.
-});
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Sync manually-selected items (from the Review tab) to Crosslist.
-// Skips the fetch phase — items are already provided by the popup.
-// ─────────────────────────────────────────────────────────────────────────────
-
-chrome.runtime.onMessage.addListener((msg, _sender, _sendResponse) => {
-  if (msg.type !== "sync-manual-items") return;
-
-  (async () => {
-    await stateReady;
-    try {
-      const items = msg.items || [];
-
-      // Reset counters but keep existing logs so previous work is visible.
-      syncState.running = true;
-      syncState.found = 0;
-      syncState.synced = 0;
-      syncState.errors = 0;
-      syncState.pendingItems = [];
-      syncState.erroredItems = [];
-      saveNow();
-
-      // Filter out items already in sync history.
-      const { syncHistory = [] } = await chrome.storage.local.get({ syncHistory: [] });
-      const historyKeys = new Set(syncHistory.map((e) => `${e.platform}:${e.id}`));
-      const newItems = items.filter((i) => !historyKeys.has(`${i.platform}:${i.id}`));
-
-      const skipped = items.length - newItems.length;
-      if (skipped > 0) {
-        emitLog(`Skipped ${skipped} item(s) already synced.`, "info");
-      }
-
-      emitCounts({ found: newItems.length });
-
-      if (newItems.length === 0) {
-        emitLog("All selected items already synced. Nothing to do.", "ok");
-        syncState.running = false;
-        saveNow();
-        chrome.runtime.sendMessage({ type: "sync-done", completed: true }).catch(() => {});
-        return;
-      }
-
-      syncState.pendingItems = newItems;
-      saveNow();
-      emitLog(`${newItems.length} item(s) to process.`);
-      await sendToCrosslist(newItems);
-    } catch (err) {
-      emitLog(`Fatal error: ${err.message}`, "error");
-      syncState.running = false;
-      saveNow();
-      chrome.runtime.sendMessage({ type: "sync-done", completed: false }).catch(() => {});
-    }
-  })();
-
-  return true;
-});
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Intercept progress messages from the content script to update persisted state.
-// (emitLog/emitCounts only catch service-worker-originated messages; this catches
-// messages sent by the content script via chrome.runtime.sendMessage.)
-// ─────────────────────────────────────────────────────────────────────────────
-
-chrome.runtime.onMessage.addListener((msg) => {
+  // ── Intercept content-script progress messages ──
   if (msg.type === "sync-log") {
     syncState.logs.push({ text: msg.text, level: msg.level || "info" });
     if (syncState.logs.length > 200) syncState.logs.splice(0, syncState.logs.length - 200);
@@ -908,93 +711,358 @@ chrome.runtime.onMessage.addListener((msg) => {
     syncState.running = false;
     if (msg.completed) {
       syncState.pendingItems = [];
+      syncState.erroredItems = [];
+      // Feature #18: Completion notification.
+      chrome.notifications.create({
+        type: "basic",
+        iconUrl: "icons/icon128.png",
+        title: "Sync Complete",
+        message: `${syncState.synced} item(s) synced, ${syncState.errors} error(s).`,
+      }).catch?.(() => {});
     }
     saveNow();
+  }
+
+  // ── Sync error entry ──
+  if (msg.type === "sync-error-entry") {
+    if (msg.item) {
+      const key = `${msg.item.platform}:${msg.item.id}`;
+      const already = syncState.erroredItems.some((i) => `${i.platform}:${i.id}` === key);
+      if (!already) {
+        syncState.erroredItems.push(msg.item);
+        scheduleSave();
+      }
+    }
+    return;
+  }
+
+  // ── Sync history entry ──
+  if (msg.type === "sync-history-entry") {
+    const entry = msg.entry;
+    if (entry) {
+      chrome.storage.local.get({ syncHistory: [] }, (data) => {
+        const history = data.syncHistory;
+        history.push(entry);
+        if (history.length > HISTORY_CAP) {
+          history.splice(0, history.length - HISTORY_CAP);
+        }
+        chrome.storage.local.set({ syncHistory: history });
+      });
+    }
+    return;
+  }
+
+  // ── Get sync state ──
+  if (msg.type === "get-sync-state") {
+    stateReady.then(() => sendResponse(syncState));
+    return true;
+  }
+
+  // ── Stop sync ──
+  if (msg.type === "stop-sync") {
+    chrome.tabs.query({ url: "*://app.crosslist.com/*" }, (tabs) => {
+      for (const tab of tabs) {
+        chrome.tabs.sendMessage(tab.id, { type: "stop-sync" }).catch(() => {});
+      }
+    });
+    return;
+  }
+
+  // ── Clear errors ──
+  if (msg.type === "clear-errors") {
+    syncState.erroredItems = [];
+    saveNow();
+    return;
+  }
+
+  // ── Start sync ──
+  if (msg.type === "start-sync") {
+    (async () => {
+      await stateReady;
+      try {
+        syncState = { running: true, found: 0, synced: 0, errors: 0, logs: [], pendingItems: [], erroredItems: [] };
+        saveNow();
+
+        const { platforms, vintedUserId, mode, dryRun } = msg;
+        const latestOnly = mode !== "full";
+        let allItems = [];
+
+        const jobs = [];
+        if (platforms.vinted) jobs.push(fetchVintedSales(vintedUserId, latestOnly));
+        if (platforms.ebay)   jobs.push(fetchEbaySales(latestOnly));
+
+        const results = await Promise.allSettled(jobs);
+        for (const r of results) {
+          if (r.status === "fulfilled") allItems.push(...r.value);
+        }
+
+        allItems = dedup(allItems);
+        emitCounts({ found: allItems.length });
+        emitLog(`Total unique items: ${allItems.length}`);
+
+        if (allItems.length === 0) {
+          emitLog("Nothing to sync.", "warn");
+          syncState.running = false;
+          saveNow();
+          chrome.runtime.sendMessage({ type: "sync-done", completed: true }).catch(() => {});
+          return;
+        }
+
+        const { syncHistory = [] } = await chrome.storage.local.get({ syncHistory: [] });
+        const historyKeys = new Set(syncHistory.map((e) => `${e.platform}:${e.id}`));
+        const newItems = allItems.filter((i) => !historyKeys.has(`${i.platform}:${i.id}`));
+        const skipped = allItems.length - newItems.length;
+
+        if (skipped > 0) {
+          emitLog(`Skipped ${skipped} item(s) already synced.`, "info");
+        }
+
+        if (newItems.length === 0) {
+          emitLog("All items already synced. Nothing to do.", "ok");
+          syncState.running = false;
+          saveNow();
+          chrome.runtime.sendMessage({ type: "sync-done", completed: true }).catch(() => {});
+          return;
+        }
+
+        syncState.pendingItems = newItems;
+        saveNow();
+        emitLog(`${newItems.length} item(s) to process.`);
+        await sendToCrosslist(newItems, dryRun);
+      } catch (err) {
+        emitLog(`Fatal error: ${err.message}`, "error");
+        syncState.running = false;
+        saveNow();
+        chrome.runtime.sendMessage({ type: "sync-done", completed: false }).catch(() => {});
+      }
+    })();
+    return true;
+  }
+
+  // ── Sync manual items ──
+  if (msg.type === "sync-manual-items") {
+    (async () => {
+      await stateReady;
+      try {
+        const items = msg.items || [];
+
+        // Feature #31: Log session separator if there are existing logs.
+        if (syncState.logs.length > 0) {
+          syncState.logs.push({ text: "────────────────────────────────", level: "info" });
+        }
+
+        // Reset counters but keep existing logs so previous work is visible.
+        syncState.running = true;
+        syncState.found = 0;
+        syncState.synced = 0;
+        syncState.errors = 0;
+        syncState.pendingItems = [];
+        syncState.erroredItems = [];
+        saveNow();
+
+        const { syncHistory = [] } = await chrome.storage.local.get({ syncHistory: [] });
+        const historyKeys = new Set(syncHistory.map((e) => `${e.platform}:${e.id}`));
+        const newItems = items.filter((i) => !historyKeys.has(`${i.platform}:${i.id}`));
+
+        const skipped = items.length - newItems.length;
+        if (skipped > 0) {
+          emitLog(`Skipped ${skipped} item(s) already synced.`, "info");
+        }
+
+        emitCounts({ found: newItems.length });
+
+        if (newItems.length === 0) {
+          emitLog("All selected items already synced. Nothing to do.", "ok");
+          syncState.running = false;
+          saveNow();
+          chrome.runtime.sendMessage({ type: "sync-done", completed: true }).catch(() => {});
+          return;
+        }
+
+        syncState.pendingItems = newItems;
+        saveNow();
+        emitLog(`${newItems.length} item(s) to process.`);
+        await sendToCrosslist(newItems);
+      } catch (err) {
+        emitLog(`Fatal error: ${err.message}`, "error");
+        syncState.running = false;
+        saveNow();
+        chrome.runtime.sendMessage({ type: "sync-done", completed: false }).catch(() => {});
+      }
+    })();
+    return true;
+  }
+
+  // ── Fetch cancelled ──
+  if (msg.type === "fetch-cancelled") {
+    (async () => {
+      try {
+        let allItems = [];
+        const platforms = msg.platforms || { vinted: true, ebay: false };
+
+        if (platforms.vinted) {
+          const vintedItems = await fetchVintedCancelled();
+          allItems.push(...vintedItems);
+        }
+
+        if (platforms.ebay) {
+          const ebayItems = await fetchEbayCancelled();
+          allItems.push(...ebayItems);
+        }
+
+        const { syncHistory = [] } = await chrome.storage.local.get({ syncHistory: [] });
+        const historyKeys = new Set(syncHistory.map((e) => `${e.platform}:${e.id}`));
+        const newItems = allItems.filter((i) => {
+          const platform = i.source || "vinted";
+          return !historyKeys.has(`${platform}:${i.transaction_id}`);
+        });
+        sendResponse({ items: newItems });
+      } catch (err) {
+        sendResponse({ items: [], error: err.message });
+      }
+    })();
+    return true;
+  }
+
+  // ── Resume sync ──
+  if (msg.type === "resume-sync") {
+    (async () => {
+      await stateReady;
+      try {
+        const items = syncState.pendingItems;
+        if (!items || items.length === 0) {
+          emitLog("No items to resume.", "warn");
+          syncState.running = false;
+          saveNow();
+          chrome.runtime.sendMessage({ type: "sync-done", completed: true }).catch(() => {});
+          return;
+        }
+
+        const { syncHistory = [] } = await chrome.storage.local.get({ syncHistory: [] });
+        const historyKeys = new Set(syncHistory.map((e) => `${e.platform}:${e.id}`));
+        const remaining = items.filter((i) => !historyKeys.has(`${i.platform}:${i.id}`));
+
+        if (remaining.length === 0) {
+          emitLog("All items already synced. Nothing to resume.", "ok");
+          syncState.running = false;
+          syncState.pendingItems = [];
+          saveNow();
+          chrome.runtime.sendMessage({ type: "sync-done", completed: true }).catch(() => {});
+          return;
+        }
+
+        syncState.running = true;
+        syncState.pendingItems = remaining;
+        syncState.synced = 0;
+        syncState.errors = 0;
+        syncState.logs = [];
+        saveNow();
+
+        emitCounts({ found: remaining.length, synced: 0, errors: 0 });
+        emitLog(`Resuming sync: ${remaining.length} item(s) remaining.`);
+        await sendToCrosslist(remaining);
+      } catch (err) {
+        emitLog(`Resume error: ${err.message}`, "error");
+        syncState.running = false;
+        saveNow();
+        chrome.runtime.sendMessage({ type: "sync-done", completed: false }).catch(() => {});
+      }
+    })();
+    return true;
+  }
+
+  // ── Retry errors ──
+  if (msg.type === "retry-errors") {
+    (async () => {
+      await stateReady;
+      try {
+        const items = syncState.erroredItems || [];
+        if (items.length === 0) {
+          emitLog("No errored items to retry.", "warn");
+          syncState.running = false;
+          saveNow();
+          chrome.runtime.sendMessage({ type: "sync-done", completed: true }).catch(() => {});
+          return;
+        }
+
+        // Filter out items that were manually resolved (now in syncHistory).
+        const { syncHistory = [] } = await chrome.storage.local.get({ syncHistory: [] });
+        const historyKeys = new Set(syncHistory.map((e) => `${e.platform}:${e.id}`));
+        const remaining = items.filter((i) => !historyKeys.has(`${i.platform}:${i.id}`));
+
+        // Bug #7: Keep erroredItems until sync-done with completed:true confirms
+        // everything finished — prevents item loss if user stops mid-retry.
+        const retryItems = [...remaining];
+        syncState = {
+          running: true,
+          found: 0,
+          synced: 0,
+          errors: 0,
+          logs: [],
+          pendingItems: retryItems,
+          erroredItems: retryItems, // Keep until completed.
+        };
+        saveNow();
+
+        if (remaining.length === 0) {
+          emitLog("All errored items have since been resolved.", "ok");
+          syncState.running = false;
+          syncState.erroredItems = [];
+          saveNow();
+          chrome.runtime.sendMessage({ type: "sync-done", completed: true }).catch(() => {});
+          return;
+        }
+
+        emitCounts({ found: remaining.length, synced: 0, errors: 0 });
+        emitLog(`Retrying ${remaining.length} errored item(s)...`);
+        await sendToCrosslist(remaining);
+      } catch (err) {
+        emitLog(`Retry error: ${err.message}`, "error");
+        syncState.running = false;
+        saveNow();
+        chrome.runtime.sendMessage({ type: "sync-done", completed: false }).catch(() => {});
+      }
+    })();
+    return true;
   }
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Return current sync state to the popup on request.
+// Auto-sync via chrome.alarms — enabled/disabled from the popup settings.
 // ─────────────────────────────────────────────────────────────────────────────
 
-chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
-  if (msg.type !== "get-sync-state") return;
-  // Wait for persisted state to be loaded before responding.
-  stateReady.then(() => sendResponse(syncState));
-  return true; // Keep channel open for async sendResponse.
+const AUTO_SYNC_ALARM = "auto-sync";
+const AUTO_SYNC_DEFAULT_MINUTES = 30;
+
+// Set up or tear down the alarm based on the stored setting.
+async function applyAutoSyncSetting() {
+  const { autoSync } = await chrome.storage.local.get({ autoSync: false });
+  if (autoSync) {
+    chrome.alarms.create(AUTO_SYNC_ALARM, { periodInMinutes: AUTO_SYNC_DEFAULT_MINUTES });
+  } else {
+    chrome.alarms.clear(AUTO_SYNC_ALARM);
+  }
+}
+
+// Apply on startup.
+applyAutoSyncSetting();
+
+// Re-apply whenever the setting changes (e.g. user toggles in popup).
+chrome.storage.onChanged.addListener((changes) => {
+  if (changes.autoSync) applyAutoSyncSetting();
 });
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Resume a stopped sync — filter already-done items and send remainder.
-// ─────────────────────────────────────────────────────────────────────────────
-
-chrome.runtime.onMessage.addListener((msg) => {
-  if (msg.type !== "resume-sync") return;
-
-  (async () => {
-    await stateReady;
-    try {
-      const items = syncState.pendingItems;
-      if (!items || items.length === 0) {
-        emitLog("No items to resume.", "warn");
-        syncState.running = false;
-        saveNow();
-        chrome.runtime.sendMessage({ type: "sync-done", completed: true }).catch(() => {});
-        return;
-      }
-
-      // Filter out items completed since the sync was stopped.
-      const { syncHistory = [] } = await chrome.storage.local.get({ syncHistory: [] });
-      const historyKeys = new Set(syncHistory.map((e) => `${e.platform}:${e.id}`));
-      const remaining = items.filter((i) => !historyKeys.has(`${i.platform}:${i.id}`));
-
-      if (remaining.length === 0) {
-        emitLog("All items already synced. Nothing to resume.", "ok");
-        syncState.running = false;
-        syncState.pendingItems = [];
-        saveNow();
-        chrome.runtime.sendMessage({ type: "sync-done", completed: true }).catch(() => {});
-        return;
-      }
-
-      syncState.running = true;
-      syncState.pendingItems = remaining;
-      syncState.synced = 0;
-      syncState.errors = 0;
-      syncState.logs = [];
-      saveNow();
-
-      emitCounts({ found: remaining.length, synced: 0, errors: 0 });
-      emitLog(`Resuming sync: ${remaining.length} item(s) remaining.`);
-      await sendToCrosslist(remaining);
-    } catch (err) {
-      emitLog(`Resume error: ${err.message}`, "error");
-      syncState.running = false;
-      saveNow();
-      chrome.runtime.sendMessage({ type: "sync-done", completed: false }).catch(() => {});
-    }
-  })();
-
-  return true;
+chrome.alarms.onAlarm.addListener(async (alarm) => {
+  if (alarm.name !== AUTO_SYNC_ALARM) return;
+  // Only fire if not already syncing.
+  if (syncState.running) return;
+  const { vintedUserId, autoSync } = await chrome.storage.local.get(["vintedUserId", "autoSync"]);
+  if (!autoSync || !vintedUserId) return;
+  // Trigger a "latest" sync for both platforms.
+  chrome.runtime.sendMessage({
+    type: "start-sync",
+    mode: "latest",
+    platforms: { vinted: true, ebay: true },
+    vintedUserId,
+  }).catch(() => {});
 });
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Optional: periodic background sync via chrome.alarms.
-// Uncomment the block below to auto-sync every N minutes.
-// ─────────────────────────────────────────────────────────────────────────────
-//
-// const SYNC_INTERVAL_MINUTES = 30;
-//
-// chrome.alarms.create("auto-sync", { periodInMinutes: SYNC_INTERVAL_MINUTES });
-//
-// chrome.alarms.onAlarm.addListener(async (alarm) => {
-//   if (alarm.name !== "auto-sync") return;
-//   const { vintedUserId } = await chrome.storage.local.get(["vintedUserId"]);
-//   if (!vintedUserId) return;
-//   // Trigger the same sync flow.
-//   chrome.runtime.sendMessage({
-//     type: "start-sync",
-//     platforms: { vinted: true, ebay: true },
-//     vintedUserId,
-//   });
-// });
