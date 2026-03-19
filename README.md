@@ -125,9 +125,10 @@ This is the main screen where you sync your sold items into Crosslist.
 1. Make sure your platforms are selected and your Vinted User ID is entered.
 2. Click **"Sync Latest"** (the blue button). This fetches your most recent sold items.
 3. The extension will:
-   - Fetch your sold items from Vinted and/or eBay
+   - Fetch your sold items from Vinted and/or eBay (only confirmed completed/shipped orders)
    - Open or switch to a Crosslist tab
-   - Search for each item in Crosslist by its title
+   - Search for each item in Crosslist by SKU (if available) or title
+   - Verify the match using title similarity scoring and SKU cross-checking — if the match is ambiguous (e.g. size variants), it skips the item rather than risk acting on the wrong one
    - Tick the "Sold" checkbox on matching listings
    - Click "Delist" to remove them from active marketplaces
 4. You can watch the progress in the **Activity Log** at the bottom and the **Found / Synced / Errors** counters.
@@ -209,11 +210,19 @@ No, this is a Chrome extension (Manifest V3). It works on Chrome and other Chrom
 ### What does "No listing found" mean?
 
 This means the extension searched for an item's title in Crosslist but couldn't find a matching listing. This can happen if:
-- The item title in Crosslist is different from the one on Vinted/eBay
+- The item title in Crosslist is very different from the one on Vinted/eBay
 - The listing was already deleted from Crosslist
 - Crosslist's search didn't return results for that title
 
 You can use the **"Retry Errors"** button to try again, or manually mark it in Crosslist.
+
+### What does "AMBIGUOUS match" mean?
+
+This means the extension found two or more listings in Crosslist with very similar titles (e.g. size or colour variants of the same product) and couldn't tell which one is correct. Rather than risk acting on the wrong listing, it skips the item. If your items have SKUs set in Crosslist, the extension uses those to break the tie automatically. Otherwise, you'll need to mark the item manually.
+
+### What if an item is returned and I relist it?
+
+The extension tracks synced items for 30 days. If an item is returned and you relist it, and it sells again after 30 days, it will be picked up by the next sync. If it sells again within 30 days of the original sync, you'll need to process it manually or clear your history.
 
 ### What's the difference between "Sync Latest" and "Full Sync"?
 
@@ -252,11 +261,12 @@ The Crosslist tab needs to stay open because the extension automates actions on 
 | **"No sold items found (or not logged in)"** | Make sure you're logged into Vinted/eBay in Chrome. Try visiting the site in a normal tab and check you can see your account. |
 | **Vinted returns errors** | Your session may have expired. Log out of Vinted and log back in, then try the sync again. |
 | **eBay returns no items** | Make sure you're logged into eBay Seller Hub. Visit `ebay.co.uk/sh/ord` in a tab first and check you can see your orders. |
-| **"No listing found" for every item** | The item titles in Crosslist may not match the titles on Vinted/eBay. Crosslist's search needs a close match. You may need to sync these manually. |
+| **"No listing found" for every item** | The item titles in Crosslist may not match the titles on Vinted/eBay. The extension requires at least 60% word overlap to match. You may need to sync these manually. |
+| **"AMBIGUOUS match" for some items** | You have multiple listings with very similar titles (e.g. size variants). Add SKUs to your Crosslist listings — the extension uses them to tell similar items apart. |
 | **Extension not appearing in toolbar** | Go to `chrome://extensions` and make sure it's enabled (toggle is on). Then click the puzzle piece icon in Chrome and pin it. |
 | **Extension stopped working after moving the folder** | Chrome loads the extension from the folder's original location. Go to `chrome://extensions`, remove the extension, and re-load it from the new location. |
 | **Sync seems stuck** | The Crosslist tab may have a dialog or notification blocking the automation. Switch to the Crosslist tab, close any popups or dialogs, and the sync should continue. |
-| **Items getting processed twice** | This shouldn't happen — synced items are tracked in the History. If it does, check the History tab. If it's empty, history may have been cleared accidentally. |
+| **Items getting processed twice** | Synced items are tracked in the History for 30 days. After that, history entries expire so returned/relisted items can be re-synced. If items are being duplicated within 30 days, check the History tab. |
 
 ---
 

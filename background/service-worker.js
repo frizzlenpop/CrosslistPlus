@@ -178,9 +178,23 @@ async function fetchVintedSales(userId, latestOnly = false) {
         const orders = json.my_orders || [];
 
         for (const order of orders) {
-          // Skip cancelled orders — handled separately in the Review tab.
           const status = (order.status || "").toLowerCase();
-          if (status.includes("cancel") || status.includes("refund")) continue;
+
+          // Allowlist approach — only accept orders with confirmed completion.
+          // Empty status is allowed (Vinted often returns no status for finalized transactions).
+          const ALLOWED_STATUSES = ["completed", "delivered", "finalised", "finalized"];
+          const BLOCKED_STATUSES = ["cancel", "refund", "dispute", "pending", "processing", "shipping"];
+
+          const isAllowed = status === "" || ALLOWED_STATUSES.some((s) => status.includes(s));
+          const isBlocked = BLOCKED_STATUSES.some((s) => status.includes(s));
+
+          if (isBlocked) continue;
+
+          if (!isAllowed) {
+            // Unknown status — fail safe, skip with warning.
+            console.warn(`[InventorySync] Vinted orders: skipping "${order.title}" — unrecognized status: "${status}"`);
+            continue;
+          }
 
           // Skip items already found via the wardrobe API (dedup by title).
           const titleKey = (order.title || "").toLowerCase().trim();
@@ -409,7 +423,7 @@ async function fetchEbaySales(latestOnly = false) {
     // hijacking the user's existing eBay browsing tab.
     usedDomain = domains[0];
     const newTab = await chrome.tabs.create({
-      url: `https://${usedDomain}/sh/ord/?filter=status:ALL_ORDERS`,
+      url: `https://${usedDomain}/sh/ord/?filter=status:PAID_AND_SHIPPED`,
       active: false,
     });
     tabId = newTab.id;
@@ -427,7 +441,7 @@ async function fetchEbaySales(latestOnly = false) {
       soldItems = await scrapeEbayOrdersFromTab(
         tabId,
         usedDomain,
-        `/sh/ord/?offset=0&limit=200&filter=status:ALL_ORDERS,timerange:LAST90D`,
+        `/sh/ord/?offset=0&limit=200&filter=status:PAID_AND_SHIPPED,timerange:LAST90D`,
         "sold"
       );
     } else {
@@ -435,7 +449,7 @@ async function fetchEbaySales(latestOnly = false) {
       soldItems = await scrapeEbayAllPages(
         tabId,
         usedDomain,
-        `status:ALL_ORDERS,timerange:CUSTOM,startDate:0,endDate:${endDate}`,
+        `status:PAID_AND_SHIPPED,timerange:CUSTOM,startDate:0,endDate:${endDate}`,
         "sold"
       );
     }
@@ -532,8 +546,27 @@ async function scrapeEbayOrdersFromTab(tabId, domain, path, defaultStatus) {
  * It reads the order table DOM and returns an array of normalized items.
  *
  * Passed as the `func` argument to chrome.scripting.executeScript.
+ *
+ * Status validation (second layer of defense after the URL filter):
+ *   - For normal order pages: only include rows whose visible status matches
+ *     COMPLETED_PATTERNS. Unknown/unreadable status → skip (fail safe).
+ *   - For /sh/ord/cancel pages (defaultStatus === "canceled"): all rows are
+ *     cancellations, so skip status validation.
  */
 function scrapeEbayOrdersDOM(defaultStatus) {
+  // Patterns indicating a truly completed/shipped order.
+  const COMPLETED_PATTERNS = [
+    "paid and shipped", "shipped", "delivered", "completed",
+    "paid and delivered", "dispatched",
+  ];
+
+  // Patterns indicating a non-completed order — explicit exclusion.
+  const EXCLUDED_PATTERNS = [
+    "awaiting payment", "awaiting shipment", "pending", "cancel",
+    "return", "refund", "dispute", "unpaid", "payment failed",
+    "on hold", "not yet shipped",
+  ];
+
   const items = [];
   const rows = document.querySelectorAll("tr");
 
@@ -541,6 +574,39 @@ function scrapeEbayOrdersDOM(defaultStatus) {
     // Each order row has a link containing orderid= in the href.
     const orderLink = row.querySelector('a[href*="orderid="]');
     if (!orderLink) continue;
+
+    // ── Status validation (skip for cancel pages) ──
+    if (defaultStatus !== "canceled") {
+      // Read all text content from the row's cells to find a status indicator.
+      const cells = row.querySelectorAll("td");
+      let rowStatusText = "";
+      for (const cell of cells) {
+        const cellText = cell.textContent.trim().toLowerCase();
+        // Look for cells whose text matches known patterns.
+        const isCompleted = COMPLETED_PATTERNS.some((p) => cellText.includes(p));
+        const isExcluded = EXCLUDED_PATTERNS.some((p) => cellText.includes(p));
+        if (isCompleted || isExcluded) {
+          rowStatusText = cellText;
+          break;
+        }
+      }
+
+      const isCompleted = COMPLETED_PATTERNS.some((p) => rowStatusText.includes(p));
+      const isExcluded = EXCLUDED_PATTERNS.some((p) => rowStatusText.includes(p));
+
+      if (isExcluded) {
+        // Explicitly non-completed — skip.
+        continue;
+      }
+
+      if (!isCompleted) {
+        // Unknown or unreadable status — fail safe, skip.
+        const itemLink = row.querySelector('a[href*="/itm/"]');
+        const title = itemLink ? itemLink.textContent.trim() : "(unknown)";
+        console.warn(`[InventorySync] eBay: skipping "${title}" — unrecognized status: "${rowStatusText || "(empty)"}"`);
+        continue;
+      }
+    }
 
     // Extract order ID from href.
     const orderIdMatch = orderLink.href.match(/orderid=([^&]+)/);
@@ -689,6 +755,24 @@ async function sendToCrosslist(items, dryRun = false) {
 
 const HISTORY_CAP = 500;
 
+// History entries older than this are considered stale — the item may have been
+// returned and relisted, so we allow it to be synced again.
+const HISTORY_STALENESS_MS = 30 * 24 * 60 * 60 * 1000; // 30 days
+
+/**
+ * Build a Set of "platform:id" keys from syncHistory, but only for entries
+ * that are recent (< HISTORY_STALENESS_MS old).  Older entries are ignored
+ * so returned/relisted items can be re-synced.
+ */
+function buildRecentHistoryKeys(syncHistory) {
+  const cutoff = Date.now() - HISTORY_STALENESS_MS;
+  return new Set(
+    syncHistory
+      .filter((e) => (e.timestamp || 0) > cutoff)
+      .map((e) => `${e.platform}:${e.id}`)
+  );
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Consolidated message listener — handles ALL messages from popup and content
 // scripts in one place to avoid listener ordering and return-value conflicts.
@@ -779,6 +863,11 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   if (msg.type === "start-sync") {
     (async () => {
       await stateReady;
+      if (syncState.running) {
+        emitLog("Sync already in progress — ignoring duplicate request.", "warn");
+        sendResponse?.({ ok: false, reason: "busy" });
+        return;
+      }
       try {
         syncState = { running: true, found: 0, synced: 0, errors: 0, logs: [], pendingItems: [], erroredItems: [] };
         saveNow();
@@ -809,12 +898,12 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
         }
 
         const { syncHistory = [] } = await chrome.storage.local.get({ syncHistory: [] });
-        const historyKeys = new Set(syncHistory.map((e) => `${e.platform}:${e.id}`));
+        const historyKeys = buildRecentHistoryKeys(syncHistory);
         const newItems = allItems.filter((i) => !historyKeys.has(`${i.platform}:${i.id}`));
         const skipped = allItems.length - newItems.length;
 
         if (skipped > 0) {
-          emitLog(`Skipped ${skipped} item(s) already synced.`, "info");
+          emitLog(`Skipped ${skipped} item(s) already synced (within last 30 days).`, "info");
         }
 
         if (newItems.length === 0) {
@@ -861,12 +950,12 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
         saveNow();
 
         const { syncHistory = [] } = await chrome.storage.local.get({ syncHistory: [] });
-        const historyKeys = new Set(syncHistory.map((e) => `${e.platform}:${e.id}`));
+        const historyKeys = buildRecentHistoryKeys(syncHistory);
         const newItems = items.filter((i) => !historyKeys.has(`${i.platform}:${i.id}`));
 
         const skipped = items.length - newItems.length;
         if (skipped > 0) {
-          emitLog(`Skipped ${skipped} item(s) already synced.`, "info");
+          emitLog(`Skipped ${skipped} item(s) already synced (within last 30 days).`, "info");
         }
 
         emitCounts({ found: newItems.length });
@@ -911,7 +1000,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
         }
 
         const { syncHistory = [] } = await chrome.storage.local.get({ syncHistory: [] });
-        const historyKeys = new Set(syncHistory.map((e) => `${e.platform}:${e.id}`));
+        const historyKeys = buildRecentHistoryKeys(syncHistory);
         const newItems = allItems.filter((i) => {
           const platform = i.source || "vinted";
           return !historyKeys.has(`${platform}:${i.transaction_id}`);
@@ -939,7 +1028,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
         }
 
         const { syncHistory = [] } = await chrome.storage.local.get({ syncHistory: [] });
-        const historyKeys = new Set(syncHistory.map((e) => `${e.platform}:${e.id}`));
+        const historyKeys = buildRecentHistoryKeys(syncHistory);
         const remaining = items.filter((i) => !historyKeys.has(`${i.platform}:${i.id}`));
 
         if (remaining.length === 0) {
@@ -987,7 +1076,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
 
         // Filter out items that were manually resolved (now in syncHistory).
         const { syncHistory = [] } = await chrome.storage.local.get({ syncHistory: [] });
-        const historyKeys = new Set(syncHistory.map((e) => `${e.platform}:${e.id}`));
+        const historyKeys = buildRecentHistoryKeys(syncHistory);
         const remaining = items.filter((i) => !historyKeys.has(`${i.platform}:${i.id}`));
 
         // Bug #7: Keep erroredItems until sync-done with completed:true confirms

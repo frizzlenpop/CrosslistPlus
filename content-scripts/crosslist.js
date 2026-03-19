@@ -23,6 +23,72 @@ if (window.__crosslistSyncLoaded) {
 } else {
     window.__crosslistSyncLoaded = true;
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Title similarity — prevents acting on the wrong Crosslist listing.
+// ─────────────────────────────────────────────────────────────────────────────
+
+const MATCH_THRESHOLD = 0.6;       // 60% word overlap required
+const SHORT_TITLE_WORDS = 3;       // Titles with fewer words need exact match
+const SKU_MATCH_THRESHOLD = 0.3;   // Lower bar when SKU already matched
+const AMBIGUITY_MARGIN = 0.15;     // If top two title scores differ by less, it's ambiguous
+
+/**
+ * Normalize a title for comparison: lowercase, strip punctuation, collapse whitespace.
+ */
+function normalizeTitle(t) {
+  return (t || "")
+    .toLowerCase()
+    .replace(/[^\w\s]/g, " ")   // punctuation → space
+    .replace(/\s+/g, " ")       // collapse whitespace
+    .trim();
+}
+
+/**
+ * Word-level Jaccard similarity: |intersection| / |union|.
+ * Returns a score between 0.0 and 1.0.
+ */
+function titleSimilarity(a, b) {
+  const wordsA = new Set(normalizeTitle(a).split(" ").filter(Boolean));
+  const wordsB = new Set(normalizeTitle(b).split(" ").filter(Boolean));
+  if (wordsA.size === 0 || wordsB.size === 0) return 0;
+
+  let intersection = 0;
+  for (const w of wordsA) {
+    if (wordsB.has(w)) intersection++;
+  }
+  const union = new Set([...wordsA, ...wordsB]).size;
+  return intersection / union;
+}
+
+/**
+ * Decide whether `searchTitle` and `rowTitle` refer to the same listing.
+ * Returns { match: boolean, score: number, reason: string }.
+ */
+function isTitleMatch(searchTitle, rowTitle) {
+  const normSearch = normalizeTitle(searchTitle);
+  const normRow = normalizeTitle(rowTitle);
+
+  // Exact normalized match is always accepted.
+  if (normSearch === normRow) {
+    return { match: true, score: 1.0, reason: "exact" };
+  }
+
+  const searchWords = normSearch.split(" ").filter(Boolean);
+  const rowWords = normRow.split(" ").filter(Boolean);
+
+  // Short titles (< 3 words on either side) require exact match to prevent
+  // "Nike" matching "Nike Shoes Black Size 10".
+  if (searchWords.length < SHORT_TITLE_WORDS || rowWords.length < SHORT_TITLE_WORDS) {
+    return { match: false, score: titleSimilarity(searchTitle, rowTitle), reason: "short-title-no-exact" };
+  }
+
+  const score = titleSimilarity(searchTitle, rowTitle);
+  if (score >= MATCH_THRESHOLD) {
+    return { match: true, score, reason: "jaccard" };
+  }
+  return { match: false, score, reason: "below-threshold" };
+}
+
 const SELECTORS = {
   // The search input on the "My listings" page.
   searchInput: 'input[placeholder*="Search a listing"]',
@@ -180,6 +246,29 @@ function findTitleColumnIndex() {
 }
 
 /**
+ * Find the column index for "SKU" by reading the <thead> header row.
+ * Returns a 0-based index, or 2 if not found (hardcoded fallback).
+ */
+function findSkuColumnIndex() {
+  const headers = document.querySelectorAll("table thead th, table thead td");
+  for (let i = 0; i < headers.length; i++) {
+    const text = headers[i].textContent.trim().toLowerCase();
+    if (text === "sku") return i;
+  }
+  return 2; // fallback to hardcoded
+}
+
+/**
+ * Read the SKU text from a row.
+ */
+function getRowSku(row) {
+  const skuIdx = findSkuColumnIndex();
+  const cells = row.querySelectorAll("td");
+  if (skuIdx >= 0 && skuIdx < cells.length) return cells[skuIdx].textContent.trim();
+  return "";
+}
+
+/**
  * Get the "Sold" checkbox from a table row.
  */
 function getSoldCheckbox(row) {
@@ -223,11 +312,85 @@ function getRowTitle(row) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Smart matching — picks the best row, uses SKU to break ties, and refuses
+// to act when the match is ambiguous.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Find the single best matching row for `item` among `rows`.
+ *
+ * Returns { row, title, score, reason } on success, or
+ *         { row: null, reason, ... } when no confident match exists.
+ *
+ * Ambiguity detection:
+ *   If two or more candidates have title scores within AMBIGUITY_MARGIN of
+ *   each other, we check SKU to break the tie.  If the item has a SKU and
+ *   exactly one candidate matches it, that candidate wins.  Otherwise the
+ *   match is considered ambiguous and we return null (fail safe).
+ */
+function findBestMatch(rows, item) {
+  // 1. Collect every row that passes the title-similarity threshold.
+  const candidates = [];
+  for (const row of rows) {
+    const rowTitle = getRowTitle(row);
+    const result = isTitleMatch(item.title, rowTitle);
+    if (result.match) {
+      const rowSku = getRowSku(row);
+      const skuMatch = !!(item.sku && rowSku && item.sku === rowSku);
+      candidates.push({ row, title: rowTitle, score: result.score, sku: rowSku, skuMatch });
+    }
+  }
+
+  if (candidates.length === 0) return null;
+
+  // 2. Sort by title score descending.
+  candidates.sort((a, b) => b.score - a.score);
+
+  // 3. If the item has a SKU, see if any candidate matches it.
+  if (item.sku) {
+    const skuMatches = candidates.filter((c) => c.skuMatch);
+    if (skuMatches.length >= 1) {
+      // SKU is a strong identifier — take the best-scoring SKU match.
+      return { ...skuMatches[0], reason: "sku-confirmed" };
+    }
+  }
+
+  // 4. Single candidate → no ambiguity possible.
+  if (candidates.length === 1) {
+    return { ...candidates[0], reason: "single-match" };
+  }
+
+  // 5. Multiple candidates — check whether the top score is a clear winner.
+  const top = candidates[0];
+  const second = candidates[1];
+
+  if (top.score - second.score >= AMBIGUITY_MARGIN) {
+    return { ...top, reason: "clear-winner" };
+  }
+
+  // 6. Scores are too close — try SKU as a soft tiebreaker.
+  //    Even if the item itself has no SKU, if only ONE candidate has a
+  //    non-empty SKU that matches some part of the item title or ID,
+  //    that's not enough — we need a definitive signal.
+
+  // No way to disambiguate → fail safe.
+  return {
+    row: null,
+    title: top.title,
+    score: top.score,
+    reason: "ambiguous",
+    runnerUp: second.title,
+    runnerUpScore: second.score,
+  };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Abort flag — set by "stop-sync" message to halt processing after current item.
 // ─────────────────────────────────────────────────────────────────────────────
 
 let abortSync = false;
-let syncGeneration = 0; // Incremented each time processItems is called
+let syncBusy = false;    // True while processItems is running — blocks concurrent runs
+let syncGeneration = 0;  // Incremented each time processItems is called
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Notification dismissal — close toasts and lingering dialogs after delist.
@@ -367,11 +530,11 @@ async function performDelist(row) {
  * Attempt to find a matching row by clicking the "next page" button up to
  * maxPages times.  Returns the matched row element, or null if not found.
  *
- * @param {string} searchTitle - Lowercased title string to match against.
+ * @param {object} item - The item object with .title to match against.
  * @param {number} [maxPages=3] - Maximum number of additional pages to check.
  * @returns {Promise<Element|null>}
  */
-async function tryNextPages(searchTitle, maxPages = 3) {
+async function tryNextPages(item, maxPages = 3) {
   for (let p = 0; p < maxPages; p++) {
     const nextBtn = document.querySelector('button[aria-label="Next page"], button.p-paginator-next:not([disabled])');
     if (!nextBtn) return null;
@@ -380,12 +543,9 @@ async function tryNextPages(searchTitle, maxPages = 3) {
     await sleep(1500);
 
     const rows = document.querySelectorAll(SELECTORS.listingRow);
-    for (const row of rows) {
-      const rowTitle = getRowTitle(row).toLowerCase();
-      if (rowTitle.includes(searchTitle) || searchTitle.includes(rowTitle)) {
-        return row;
-      }
-    }
+    const best = findBestMatch(rows, item);
+    if (best && best.row) return best.row;
+    // If ambiguous on this page, keep paginating — maybe a later page has a clear match.
   }
   return null;
 }
@@ -395,6 +555,11 @@ async function tryNextPages(searchTitle, maxPages = 3) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 async function processItems(items) {
+  if (syncBusy) {
+    report("Sync already in progress — ignoring duplicate request.", "warn");
+    return;
+  }
+  syncBusy = true;
   abortSync = false;
   syncGeneration++;
   const myGeneration = syncGeneration;
@@ -412,7 +577,6 @@ async function processItems(items) {
 
       // 1. Search by SKU first if available, then fall back to title.
       const searchInput = await waitForElement(SELECTORS.searchInput);
-      let searchTerm = item.title;
       let matchedRow = null;
 
       if (item.sku) {
@@ -422,19 +586,23 @@ async function processItems(items) {
 
         const skuRows = document.querySelectorAll(SELECTORS.listingRow);
         for (const row of skuRows) {
-          // Check SKU column (index 2) for exact match.
-          const cells = row.querySelectorAll("td");
-          if (cells.length > 2) {
-            const rowSku = cells[2].textContent.trim();
-            if (rowSku === item.sku) {
-              matchedRow = row;
-              break;
-            }
+          const rowSku = getRowSku(row);
+          if (rowSku && rowSku === item.sku) {
+            matchedRow = row;
+            break;
           }
         }
 
         if (!matchedRow && skuRows.length === 1) {
-          matchedRow = skuRows[0]; // Only one result — take it.
+          // Only one result from SKU search — cross-check title before accepting.
+          const candidateTitle = getRowTitle(skuRows[0]);
+          const skuScore = titleSimilarity(item.title, candidateTitle);
+          if (skuScore >= SKU_MATCH_THRESHOLD) {
+            matchedRow = skuRows[0];
+            report(`  SKU single-result accepted: "${candidateTitle}" (title score=${skuScore.toFixed(2)})`);
+          } else {
+            report(`  SKU single-result REJECTED — title mismatch: "${candidateTitle}" vs "${item.title}" (score=${skuScore.toFixed(2)})`, "warn");
+          }
         }
 
         if (!matchedRow) {
@@ -448,23 +616,26 @@ async function processItems(items) {
         await sleep(1500);
 
         const rows = document.querySelectorAll(SELECTORS.listingRow);
-        for (const row of rows) {
-          const rowTitle = getRowTitle(row).toLowerCase();
-          const searchTitle = item.title.toLowerCase();
-          if (rowTitle.includes(searchTitle) || searchTitle.includes(rowTitle)) {
-            matchedRow = row;
-            break;
-          }
-        }
+        const best = findBestMatch(rows, item);
 
-        if (!matchedRow && rows.length > 0) {
-          matchedRow = rows[0];
+        if (best && best.row) {
+          matchedRow = best.row;
+          report(`  Matched: "${best.title}" (score=${best.score.toFixed(2)}, via ${best.reason})`);
+        } else if (best && best.reason === "ambiguous") {
+          report(
+            `  AMBIGUOUS match for "${item.title}" — "${best.title}" (${best.score.toFixed(2)}) vs "${best.runnerUp}" (${best.runnerUpScore.toFixed(2)}). SKIPPING.`,
+            "warn"
+          );
+        } else if (rows.length > 0) {
+          const topTitle = getRowTitle(rows[0]);
+          const topScore = titleSimilarity(item.title, topTitle);
+          report(`  No confident match for "${item.title}" — top result: "${topTitle}" (score=${topScore.toFixed(2)}). SKIPPING.`, "warn");
         }
       }
 
       // If still no match, try paginating through additional result pages.
       if (!matchedRow) {
-        matchedRow = await tryNextPages(item.title.toLowerCase());
+        matchedRow = await tryNextPages(item);
       }
 
       if (!matchedRow) {
@@ -476,7 +647,11 @@ async function processItems(items) {
         continue;
       }
 
-      // 3. Mark the item based on status.
+      // 3. Audit trail — log exactly which row we're about to act on.
+      const actingOnTitle = getRowTitle(matchedRow);
+      report(`  ACTING ON: "${actingOnTitle}" (matched to "${item.title}", score=${titleSimilarity(item.title, actingOnTitle).toFixed(2)})`);
+
+      // 4. Mark the item based on status.
       if (item.status === "sold") {
         let markedSold = false;
         let didDelist = false;
@@ -510,14 +685,12 @@ async function processItems(items) {
         //    Re-query the row in case React re-rendered after the sold toggle.
         let freshRow = matchedRow;
         const freshRows = document.querySelectorAll(SELECTORS.listingRow);
-        for (const r of freshRows) {
-          const t = getRowTitle(r).toLowerCase();
-          const searchTitle = item.title.toLowerCase();
-          if (t.includes(searchTitle) || searchTitle.includes(t)) {
-            freshRow = r;
-            break;
-          }
+        const freshBest = findBestMatch(freshRows, item);
+        if (freshBest && freshBest.row) {
+          freshRow = freshBest.row;
         }
+        // If re-find failed or ambiguous, keep the original matchedRow
+        // reference (stale DOM but safer than picking a random row).
 
         if (getDelistButton(freshRow)) {
           const ok = await performDelist(freshRow);
@@ -580,7 +753,7 @@ async function processItems(items) {
 
       reportCounts({ synced, errors });
 
-      // 4. Clear the search for the next item.
+      // 5. Clear the search for the next item.
       await clearSearch(searchInput);
 
     } catch (err) {
@@ -591,6 +764,7 @@ async function processItems(items) {
     }
   }
 
+  syncBusy = false;
   const wasAborted = abortSync;
   report(
     wasAborted
@@ -622,6 +796,12 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   }
 
   if (msg.type !== "sync-items") return;
+
+  if (syncBusy) {
+    report("Sync already in progress — rejecting new items.", "warn");
+    sendResponse({ ok: false, reason: "busy" });
+    return;
+  }
 
   report(`Received ${msg.items.length} item(s) to process in Crosslist.`);
   processItems(msg.items);
