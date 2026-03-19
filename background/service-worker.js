@@ -196,6 +196,45 @@ async function fetchVintedSales(userId, latestOnly = false) {
             continue;
           }
 
+          // ── Bundle expansion ──
+          // Bundle orders have titles like "Bundle 3 items" and contain
+          // multiple individual items.  Fetch the transaction detail API
+          // to get the real item titles and IDs.
+          const bundleMatch = (order.title || "").match(/^Bundle\s+(\d+)\s+items?$/i);
+          if (bundleMatch) {
+            try {
+              const txRes = await fetch(
+                `https://${domain}/api/v2/transactions/${order.transaction_id}`,
+                { credentials: "include", headers: { Accept: "application/json" } }
+              );
+              if (txRes.ok) {
+                const txJson = await txRes.json();
+                const bundleItems = txJson.transaction?.order?.items || [];
+                let bundleCount = 0;
+                for (const bi of bundleItems) {
+                  const biTitle = (bi.title || "").toLowerCase().trim();
+                  if (seenTitles.has(biTitle)) continue;
+                  items.push({
+                    platform: "vinted",
+                    id:       String(bi.id),
+                    title:    bi.title || "(untitled)",
+                    sku:      "",
+                    status:   "sold",
+                  });
+                  seenTitles.add(biTitle);
+                  bundleCount++;
+                  orderCount++;
+                }
+                if (bundleCount > 0) {
+                  emitLog(`  Expanded bundle (tx ${order.transaction_id}): ${bundleCount} new item(s).`);
+                }
+              }
+            } catch (err) {
+              emitLog(`  Failed to expand bundle (tx ${order.transaction_id}): ${err.message}`, "warn");
+            }
+            continue; // Don't add the "Bundle N items" entry itself.
+          }
+
           // Skip items already found via the wardrobe API (dedup by title).
           const titleKey = (order.title || "").toLowerCase().trim();
           if (seenTitles.has(titleKey)) continue;
