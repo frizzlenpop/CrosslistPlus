@@ -1,0 +1,41 @@
+{
+  "manifest_version": 3,
+  "name": "Inventory Sync — eBay & Vinted → Crosslist",
+  "version": "1.0.0",
+  "description": "Syncs sold and canceled inventory from eBay and Vinted into Crosslist.",
+
+  "permissions": [
+    "storage",
+    "activeTab",
+    "scripting",
+    "alarms"
+  ],
+
+  "host_permissions": [
+    "*://*.vinted.com/*",
+    "*://*.vinted.co.uk/*",
+    "*://*.vinted.fr/*",
+    "*://*.vinted.de/*",
+    "*://*.ebay.com/*",
+    "*://*.ebay.co.uk/*",
+    "*://app.crosslist.com/*"
+  ],
+
+  "background": {
+    "service_worker": "background/service-worker.js",
+    "type": "module"
+  },
+
+  "action": {
+    "default_popup": "popup/popup.html",
+    "default_title": "Inventory Sync"
+  },
+
+  "content_scripts": [
+    {
+      "matches": ["*://app.crosslist.com/*"],
+      "js": ["content-scripts/crosslist.js"],
+      "run_at": "document_idle"
+    }
+  ]
+}

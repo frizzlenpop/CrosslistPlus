@@ -1,0 +1,601 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=420, initial-scale=1.0" />
+  <title>Inventory Sync</title>
+  <style>
+    /* ── Reset & Base ─────────────────────────────────── */
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      width: 420px;
+      min-height: 480px;
+      font-family: "Segoe UI", system-ui, -apple-system, sans-serif;
+      background: #0f1117;
+      color: #e2e4e9;
+      padding: 20px;
+    }
+
+    /* ── Header ───────────────────────────────────────── */
+    .header {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      margin-bottom: 20px;
+    }
+    .header h1 {
+      font-size: 16px;
+      font-weight: 600;
+      color: #fff;
+    }
+    .header .badge {
+      font-size: 10px;
+      background: #2563eb;
+      color: #fff;
+      padding: 2px 8px;
+      border-radius: 9999px;
+      font-weight: 500;
+    }
+
+    /* ── Platform Toggles ─────────────────────────────── */
+    .platforms {
+      display: flex;
+      gap: 8px;
+      margin-bottom: 16px;
+    }
+    .platform-toggle {
+      flex: 1;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      background: #1a1d27;
+      border: 1px solid #2a2d3a;
+      border-radius: 8px;
+      padding: 10px 12px;
+      cursor: pointer;
+      transition: border-color 0.2s, background 0.2s;
+    }
+    .platform-toggle:hover { border-color: #3b3f52; }
+    .platform-toggle.active { border-color: #2563eb; background: #1a1d35; }
+    .platform-toggle input { display: none; }
+    .platform-toggle .dot {
+      width: 10px; height: 10px; border-radius: 50%;
+      border: 2px solid #555;
+      transition: background 0.2s, border-color 0.2s;
+    }
+    .platform-toggle.active .dot {
+      background: #2563eb;
+      border-color: #2563eb;
+    }
+    .platform-toggle span { font-size: 13px; font-weight: 500; }
+
+    /* ── Config Section ───────────────────────────────── */
+    .config-section {
+      background: #1a1d27;
+      border: 1px solid #2a2d3a;
+      border-radius: 8px;
+      padding: 14px;
+      margin-bottom: 16px;
+    }
+    .config-section label {
+      display: block;
+      font-size: 11px;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      color: #8b8fa3;
+      margin-bottom: 6px;
+    }
+    .config-section input[type="text"] {
+      width: 100%;
+      padding: 8px 10px;
+      background: #0f1117;
+      border: 1px solid #2a2d3a;
+      border-radius: 6px;
+      color: #e2e4e9;
+      font-size: 13px;
+      outline: none;
+      transition: border-color 0.2s;
+    }
+    .config-section input[type="text"]:focus { border-color: #2563eb; }
+    .config-section .hint {
+      font-size: 11px;
+      color: #5f6377;
+      margin-top: 4px;
+    }
+
+    /* ── Sync Buttons ─────────────────────────────────── */
+    #btn-sync {
+      width: 100%;
+      padding: 12px;
+      background: #2563eb;
+      color: #fff;
+      font-size: 14px;
+      font-weight: 600;
+      border: none;
+      border-radius: 8px;
+      cursor: pointer;
+      transition: background 0.2s;
+      margin-bottom: 8px;
+    }
+    #btn-sync:hover { background: #1d4ed8; }
+    #btn-sync:disabled {
+      background: #1e293b;
+      color: #475569;
+      cursor: not-allowed;
+    }
+
+    #btn-full-sync {
+      width: 100%;
+      padding: 10px;
+      background: transparent;
+      color: #94a3b8;
+      font-size: 13px;
+      font-weight: 500;
+      border: 1px solid #2a2d3a;
+      border-radius: 8px;
+      cursor: pointer;
+      transition: background 0.2s, border-color 0.2s, color 0.2s;
+      margin-bottom: 16px;
+    }
+    #btn-full-sync:hover { border-color: #3b3f52; color: #e2e4e9; }
+    #btn-full-sync:disabled {
+      color: #475569;
+      border-color: #1e293b;
+      cursor: not-allowed;
+    }
+
+    /* ── Stop Button ───────────────────────────────────── */
+    #btn-stop {
+      width: 100%;
+      padding: 12px;
+      background: #dc2626;
+      color: #fff;
+      font-size: 14px;
+      font-weight: 600;
+      border: none;
+      border-radius: 8px;
+      cursor: pointer;
+      transition: background 0.2s;
+      margin-bottom: 16px;
+      display: none;
+    }
+    #btn-stop:hover { background: #b91c1c; }
+    #btn-stop:disabled {
+      background: #7f1d1d;
+      color: #fca5a5;
+      cursor: not-allowed;
+    }
+
+    /* ── Resume Button ─────────────────────────────────── */
+    #btn-resume {
+      width: 100%;
+      padding: 12px;
+      background: #16a34a;
+      color: #fff;
+      font-size: 14px;
+      font-weight: 600;
+      border: none;
+      border-radius: 8px;
+      cursor: pointer;
+      transition: background 0.2s;
+      margin-bottom: 8px;
+      display: none;
+    }
+    #btn-resume:hover { background: #15803d; }
+
+    /* ── Retry Errors Button ──────────────────────────── */
+    #btn-retry {
+      width: 100%;
+      padding: 12px;
+      background: #d97706;
+      color: #fff;
+      font-size: 14px;
+      font-weight: 600;
+      border: none;
+      border-radius: 8px;
+      cursor: pointer;
+      transition: background 0.2s;
+      margin-bottom: 8px;
+      display: none;
+    }
+    #btn-retry:hover { background: #b45309; }
+
+    /* ── Summary Bar ──────────────────────────────────── */
+    .summary {
+      display: flex;
+      gap: 8px;
+      margin-bottom: 16px;
+    }
+    .summary .stat {
+      flex: 1;
+      text-align: center;
+      background: #1a1d27;
+      border: 1px solid #2a2d3a;
+      border-radius: 8px;
+      padding: 10px 6px;
+    }
+    .stat .num {
+      font-size: 20px;
+      font-weight: 700;
+      color: #fff;
+    }
+    .stat .label {
+      font-size: 10px;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      color: #8b8fa3;
+      margin-top: 2px;
+    }
+
+    /* ── Log Area ─────────────────────────────────────── */
+    .log-header {
+      font-size: 11px;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      color: #8b8fa3;
+      margin-bottom: 8px;
+    }
+    #logs {
+      background: #1a1d27;
+      border: 1px solid #2a2d3a;
+      border-radius: 8px;
+      padding: 12px;
+      max-height: 200px;
+      overflow-y: auto;
+      font-family: "Cascadia Code", "Fira Code", monospace;
+      font-size: 12px;
+      line-height: 1.7;
+    }
+    #logs:empty::before {
+      content: "Waiting for sync...";
+      color: #3b3f52;
+    }
+    #logs .log-line { padding: 1px 0; }
+    #logs .log-line.info  { color: #94a3b8; }
+    #logs .log-line.ok    { color: #22c55e; }
+    #logs .log-line.warn  { color: #eab308; }
+    #logs .log-line.error { color: #ef4444; }
+
+    /* scrollbar */
+    #logs::-webkit-scrollbar { width: 4px; }
+    #logs::-webkit-scrollbar-track { background: transparent; }
+    #logs::-webkit-scrollbar-thumb { background: #2a2d3a; border-radius: 4px; }
+
+    /* ── Tab Switcher ──────────────────────────────────── */
+    .tabs {
+      display: flex;
+      gap: 4px;
+      margin-bottom: 16px;
+      background: #1a1d27;
+      border: 1px solid #2a2d3a;
+      border-radius: 8px;
+      padding: 4px;
+    }
+    .tab-btn {
+      flex: 1;
+      padding: 8px 0;
+      font-size: 13px;
+      font-weight: 600;
+      color: #8b8fa3;
+      background: transparent;
+      border: none;
+      border-radius: 6px;
+      cursor: pointer;
+      transition: background 0.2s, color 0.2s;
+    }
+    .tab-btn:hover { color: #e2e4e9; }
+    .tab-btn.active {
+      background: #2563eb;
+      color: #fff;
+    }
+
+    /* ── History View ──────────────────────────────────── */
+    #history-view { display: none; }
+    #history-list {
+      max-height: 340px;
+      overflow-y: auto;
+    }
+    #history-list::-webkit-scrollbar { width: 4px; }
+    #history-list::-webkit-scrollbar-track { background: transparent; }
+    #history-list::-webkit-scrollbar-thumb { background: #2a2d3a; border-radius: 4px; }
+
+    .history-empty {
+      text-align: center;
+      color: #3b3f52;
+      font-size: 13px;
+      padding: 40px 0;
+    }
+
+    .history-entry {
+      display: flex;
+      align-items: flex-start;
+      gap: 10px;
+      background: #1a1d27;
+      border: 1px solid #2a2d3a;
+      border-radius: 8px;
+      padding: 10px 12px;
+      margin-bottom: 6px;
+    }
+    .history-entry .h-platform {
+      font-size: 10px;
+      font-weight: 600;
+      text-transform: uppercase;
+      padding: 2px 8px;
+      border-radius: 9999px;
+      flex-shrink: 0;
+      margin-top: 2px;
+    }
+    .h-platform.vinted { background: #00645a; color: #5eead4; }
+    .h-platform.ebay   { background: #713f12; color: #fbbf24; }
+    .history-entry .h-body { flex: 1; min-width: 0; }
+    .history-entry .h-title {
+      font-size: 13px;
+      color: #e2e4e9;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .history-entry .h-meta {
+      font-size: 11px;
+      color: #5f6377;
+      margin-top: 2px;
+    }
+    .history-entry .h-action {
+      font-size: 11px;
+      font-weight: 500;
+      flex-shrink: 0;
+      margin-top: 2px;
+    }
+    .h-action.sold          { color: #22c55e; }
+    .h-action.delisted      { color: #eab308; }
+    .h-action.sold-delisted { color: #3b82f6; }
+
+    #btn-clear-history {
+      width: 100%;
+      padding: 10px;
+      margin-top: 12px;
+      background: transparent;
+      color: #ef4444;
+      font-size: 13px;
+      font-weight: 500;
+      border: 1px solid #3b1c1c;
+      border-radius: 8px;
+      cursor: pointer;
+      transition: background 0.2s;
+    }
+    #btn-clear-history:hover { background: #1c1015; }
+
+    /* ── Review View ──────────────────────────────────── */
+    #review-view { display: none; }
+
+    #btn-fetch-cancelled {
+      width: 100%;
+      padding: 12px;
+      background: #2563eb;
+      color: #fff;
+      font-size: 14px;
+      font-weight: 600;
+      border: none;
+      border-radius: 8px;
+      cursor: pointer;
+      transition: background 0.2s;
+      margin-bottom: 12px;
+    }
+    #btn-fetch-cancelled:hover { background: #1d4ed8; }
+    #btn-fetch-cancelled:disabled {
+      background: #1e293b;
+      color: #475569;
+      cursor: not-allowed;
+    }
+
+    #cancelled-list {
+      max-height: 300px;
+      overflow-y: auto;
+    }
+    #cancelled-list::-webkit-scrollbar { width: 4px; }
+    #cancelled-list::-webkit-scrollbar-track { background: transparent; }
+    #cancelled-list::-webkit-scrollbar-thumb { background: #2a2d3a; border-radius: 4px; }
+
+    .cancelled-empty {
+      text-align: center;
+      color: #3b3f52;
+      font-size: 13px;
+      padding: 40px 0;
+    }
+
+    .cancelled-card {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      background: #1a1d27;
+      border: 1px solid #2a2d3a;
+      border-radius: 8px;
+      padding: 10px 12px;
+      margin-bottom: 6px;
+      cursor: pointer;
+      transition: border-color 0.2s;
+    }
+    .cancelled-card:hover { border-color: #3b3f52; }
+    .cancelled-card.selected { border-color: #2563eb; background: #1a1d35; }
+
+    .cancelled-card .thumb {
+      width: 48px;
+      height: 48px;
+      border-radius: 6px;
+      object-fit: cover;
+      flex-shrink: 0;
+      background: #2a2d3a;
+    }
+
+    .cancelled-card .info {
+      flex: 1;
+      min-width: 0;
+    }
+    .cancelled-card .info .c-title {
+      font-size: 13px;
+      color: #e2e4e9;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .cancelled-card .info .c-meta {
+      font-size: 11px;
+      color: #8b8fa3;
+      margin-top: 2px;
+    }
+    .cancelled-card .info .c-reason {
+      font-size: 11px;
+      color: #5f6377;
+      margin-top: 1px;
+    }
+
+    .cancelled-card .c-check {
+      width: 18px;
+      height: 18px;
+      accent-color: #2563eb;
+      flex-shrink: 0;
+      cursor: pointer;
+    }
+
+    .review-footer {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      margin-top: 12px;
+      padding-top: 12px;
+      border-top: 1px solid #2a2d3a;
+    }
+    .review-footer .select-all-label {
+      font-size: 12px;
+      color: #8b8fa3;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      cursor: pointer;
+      flex-shrink: 0;
+    }
+    .review-footer .select-all-label input {
+      accent-color: #2563eb;
+    }
+    #btn-sync-cancelled {
+      flex: 1;
+      padding: 10px 14px;
+      background: #2563eb;
+      color: #fff;
+      font-size: 13px;
+      font-weight: 600;
+      border: none;
+      border-radius: 8px;
+      cursor: pointer;
+      transition: background 0.2s;
+    }
+    #btn-sync-cancelled:hover { background: #1d4ed8; }
+    #btn-sync-cancelled:disabled {
+      background: #1e293b;
+      color: #475569;
+      cursor: not-allowed;
+    }
+    .badge-count {
+      background: #1d4ed8;
+      color: #fff;
+      font-size: 11px;
+      font-weight: 600;
+      padding: 1px 7px;
+      border-radius: 9999px;
+      margin-left: 4px;
+    }
+  </style>
+</head>
+<body>
+
+  <!-- Header -->
+  <div class="header">
+    <h1>Inventory Sync</h1>
+    <span class="badge">v1.0</span>
+  </div>
+
+  <!-- Tab Switcher -->
+  <div class="tabs">
+    <button class="tab-btn active" data-tab="sync">Sync</button>
+    <button class="tab-btn" data-tab="review">Review</button>
+    <button class="tab-btn" data-tab="history">History</button>
+  </div>
+
+  <!-- ═══ Sync View ═══ -->
+  <div id="sync-view">
+
+  <!-- Platform Toggles -->
+  <div class="platforms">
+    <label class="platform-toggle active" data-platform="vinted">
+      <input type="checkbox" checked />
+      <span class="dot"></span>
+      <span>Vinted</span>
+    </label>
+    <label class="platform-toggle active" data-platform="ebay">
+      <input type="checkbox" checked />
+      <span class="dot"></span>
+      <span>eBay</span>
+    </label>
+  </div>
+
+  <!-- Vinted Config -->
+  <div class="config-section">
+    <label for="vinted-user-id">Vinted User ID</label>
+    <input type="text" id="vinted-user-id" placeholder="e.g. 123456789" />
+    <div class="hint">Profile → URL contains your numeric user ID</div>
+  </div>
+
+  <!-- Sync Buttons -->
+  <button id="btn-resume">Resume Sync</button>
+  <button id="btn-retry">Retry Errors</button>
+  <button id="btn-sync">Sync Latest</button>
+  <button id="btn-full-sync">Full Sync</button>
+  <button id="btn-stop">Stop Sync</button>
+
+  <!-- Summary Counters -->
+  <div class="summary">
+    <div class="stat">
+      <div class="num" id="count-found">0</div>
+      <div class="label">Found</div>
+    </div>
+    <div class="stat">
+      <div class="num" id="count-synced">0</div>
+      <div class="label">Synced</div>
+    </div>
+    <div class="stat">
+      <div class="num" id="count-errors">0</div>
+      <div class="label">Errors</div>
+    </div>
+  </div>
+
+  <!-- Log Output -->
+  <div class="log-header">Activity Log</div>
+  <div id="logs"></div>
+
+  </div><!-- /sync-view -->
+
+  <!-- ═══ Review View ═══ -->
+  <div id="review-view">
+    <button id="btn-fetch-cancelled">Fetch Cancelled Orders</button>
+    <div id="cancelled-list">
+      <div class="cancelled-empty">Click above to fetch cancelled Vinted orders for review.</div>
+    </div>
+    <div class="review-footer" style="display:none" id="review-footer">
+      <label class="select-all-label">
+        <input type="checkbox" id="chk-select-all" checked />
+        Select All
+      </label>
+      <button id="btn-sync-cancelled" disabled>Sync Selected to Crosslist</button>
+    </div>
+  </div>
+
+  <!-- ═══ History View ═══ -->
+  <div id="history-view">
+    <div id="history-list"></div>
+    <button id="btn-clear-history">Clear History</button>
+  </div>
+
+  <script src="popup.js"></script>
+</body>
+</html>
