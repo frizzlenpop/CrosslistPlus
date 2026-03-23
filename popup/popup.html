@@ -393,6 +393,27 @@
     }
     #btn-clear-history:hover { background: #1c1015; }
 
+    /* ── Export CSV Button ────────────────────────── */
+    #btn-export-csv {
+      width: 100%;
+      padding: 10px;
+      margin-top: 12px;
+      background: transparent;
+      color: #94a3b8;
+      font-size: 13px;
+      font-weight: 500;
+      border: 1px solid #2a2d3a;
+      border-radius: 8px;
+      cursor: pointer;
+      transition: background 0.2s, border-color 0.2s, color 0.2s;
+    }
+    #btn-export-csv:hover { border-color: #3b3f52; color: #e2e4e9; }
+    #btn-export-csv:disabled {
+      color: #475569;
+      border-color: #1e293b;
+      cursor: not-allowed;
+    }
+
     /* ── Review View ──────────────────────────────────── */
     #review-view { display: none; }
 
@@ -591,6 +612,17 @@
       display: flex;
       align-items: center;
       gap: 8px;
+      cursor: pointer;
+      transition: border-color 0.2s;
+    }
+    .error-item:hover { border-color: #3b3f52; }
+    .error-item.selected { border-color: #d97706; background: #1a1d20; }
+    .error-item .e-check {
+      width: 14px;
+      height: 14px;
+      accent-color: #d97706;
+      flex-shrink: 0;
+      cursor: pointer;
     }
     .error-item .e-title {
       color: #e2e4e9;
@@ -656,7 +688,13 @@
   <div class="config-section" style="padding: 10px 14px; margin-bottom: 12px;">
     <label style="display:flex; align-items:center; gap:8px; cursor:pointer; margin-bottom:8px; text-transform:none; letter-spacing:normal; font-size:13px; color:#e2e4e9;">
       <input type="checkbox" id="chk-auto-sync" style="accent-color:#2563eb; width:16px; height:16px;" />
-      Auto-sync every 30 minutes
+      Auto-sync every
+      <select id="auto-sync-interval" style="background:#0f1117; color:#e2e4e9; border:1px solid #2a2d3a; border-radius:4px; padding:2px 6px; font-size:12px; cursor:pointer;">
+        <option value="15">15 min</option>
+        <option value="30" selected>30 min</option>
+        <option value="60">1 hour</option>
+        <option value="120">2 hours</option>
+      </select>
     </label>
     <div class="hint" style="margin-top:0; margin-bottom:10px; margin-left:24px;">Runs in the background — syncs latest items automatically.</div>
     <label style="display:flex; align-items:center; gap:8px; cursor:pointer; margin-bottom:0; text-transform:none; letter-spacing:normal; font-size:13px; color:#e2e4e9;">
@@ -703,6 +741,9 @@
   <!-- Log Output -->
   <div class="log-header">Activity Log</div>
   <div id="logs"></div>
+
+  <!-- Export -->
+  <button id="btn-export-csv">Export Sold Listings (CSV)</button>
 
   </div><!-- /sync-view -->
 

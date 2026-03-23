@@ -211,6 +211,18 @@ function report(text, level = "info") {
   chrome.runtime.sendMessage({ type: "sync-log", text, level }).catch(() => {});
 }
 
+/**
+ * Build the timestamp for a history entry.
+ * Uses the original sale date from the platform if available, otherwise now.
+ */
+function historyTimestamp(item) {
+  if (item.saleDate) {
+    const d = new Date(item.saleDate);
+    if (!isNaN(d.getTime())) return d.getTime();
+  }
+  return Date.now();
+}
+
 function reportCounts(counts) {
   chrome.runtime.sendMessage({ type: "sync-counts", ...counts }).catch(() => {});
 }
@@ -710,7 +722,7 @@ async function processItems(items) {
           const action = didDelist ? "sold+delisted" : "sold";
           chrome.runtime.sendMessage({
             type: "sync-history-entry",
-            entry: { platform: item.platform, id: item.id, title: item.title, status: item.status, action, timestamp: Date.now() },
+            entry: { platform: item.platform, id: item.id, title: item.title, status: item.status, action, timestamp: historyTimestamp(item) },
           }).catch(() => {});
         } else if (!markedSold && soldCb && soldCb.checked && !getDelistButton(freshRow)) {
           // Already sold + already delisted — skip gracefully.
@@ -718,7 +730,7 @@ async function processItems(items) {
           synced++;
           chrome.runtime.sendMessage({
             type: "sync-history-entry",
-            entry: { platform: item.platform, id: item.id, title: item.title, status: item.status, action: "sold+delisted", timestamp: Date.now() },
+            entry: { platform: item.platform, id: item.id, title: item.title, status: item.status, action: "sold+delisted", timestamp: historyTimestamp(item) },
           }).catch(() => {});
         } else {
           errors++;
@@ -734,7 +746,7 @@ async function processItems(items) {
             synced++;
             chrome.runtime.sendMessage({
               type: "sync-history-entry",
-              entry: { platform: item.platform, id: item.id, title: item.title, status: item.status, action: "delisted", timestamp: Date.now() },
+              entry: { platform: item.platform, id: item.id, title: item.title, status: item.status, action: "delisted", timestamp: historyTimestamp(item) },
             }).catch(() => {});
           } else {
             report(`  Delist dialog failed for "${item.title}".`, "error");
@@ -746,7 +758,7 @@ async function processItems(items) {
           synced++;
           chrome.runtime.sendMessage({
             type: "sync-history-entry",
-            entry: { platform: item.platform, id: item.id, title: item.title, status: item.status, action: "delisted", timestamp: Date.now() },
+            entry: { platform: item.platform, id: item.id, title: item.title, status: item.status, action: "delisted", timestamp: historyTimestamp(item) },
           }).catch(() => {});
         }
       }

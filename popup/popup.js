@@ -22,6 +22,7 @@ const cancelledList    = $("#cancelled-list");
 const reviewFooter     = $("#review-footer");
 const chkSelectAll     = $("#chk-select-all");
 const btnSyncCancelled = $("#btn-sync-cancelled");
+const btnExportCsv     = $("#btn-export-csv");
 const errorsSection    = $("#errors-section");
 const errorsToggle     = $("#errors-toggle");
 const errorsList       = $("#errors-list");
@@ -67,13 +68,24 @@ vintedIdInput.addEventListener("change", () => {
 // ── Auto-sync toggle ────────────────────────────────────────────────────────
 
 const chkAutoSync = $("#chk-auto-sync");
+const autoSyncInterval = $("#auto-sync-interval");
 
-chrome.storage.local.get({ autoSync: false }, (data) => {
+chrome.storage.local.get({ autoSync: false, autoSyncMinutes: 30 }, (data) => {
   chkAutoSync.checked = data.autoSync;
+  autoSyncInterval.value = String(data.autoSyncMinutes || 30);
 });
 
 chkAutoSync.addEventListener("change", () => {
   chrome.storage.local.set({ autoSync: chkAutoSync.checked });
+});
+
+autoSyncInterval.addEventListener("change", () => {
+  const minutes = parseInt(autoSyncInterval.value, 10) || 30;
+  chrome.storage.local.set({ autoSyncMinutes: minutes });
+  // If auto-sync is on, the service worker will pick up the new interval via storage change.
+  if (chkAutoSync.checked) {
+    chrome.storage.local.set({ autoSync: true }); // Re-trigger the alarm setup.
+  }
 });
 
 // ── Dry-run toggle ──────────────────────────────────────────────────────────
@@ -99,12 +111,60 @@ function renderErroredItems(items) {
   errorsList.innerHTML = "";
   for (const item of items) {
     const div = document.createElement("div");
-    div.className = "error-item";
-    div.innerHTML =
-      `<span class="e-platform ${esc(item.platform)}">${esc(item.platform)}</span>` +
-      `<span class="e-title" title="${esc(item.title)}">${esc(item.title)}</span>`;
+    div.className = "error-item selected";
+    div.dataset.platform = item.platform;
+    div.dataset.itemId = item.id;
+
+    const cb = document.createElement("input");
+    cb.type = "checkbox";
+    cb.className = "e-check";
+    cb.checked = true;
+
+    cb.addEventListener("change", (e) => {
+      e.stopPropagation();
+      div.classList.toggle("selected", cb.checked);
+      updateRetryButton();
+    });
+
+    div.addEventListener("click", (e) => {
+      if (e.target === cb) return;
+      cb.checked = !cb.checked;
+      div.classList.toggle("selected", cb.checked);
+      updateRetryButton();
+    });
+
+    const platform = document.createElement("span");
+    platform.className = `e-platform ${esc(item.platform)}`;
+    platform.textContent = item.platform;
+
+    const title = document.createElement("span");
+    title.className = "e-title";
+    title.title = item.title;
+    title.textContent = item.title;
+
+    div.appendChild(cb);
+    div.appendChild(platform);
+    div.appendChild(title);
     errorsList.appendChild(div);
   }
+  updateRetryButton();
+}
+
+function getSelectedErrorCount() {
+  return errorsList.querySelectorAll(".e-check:checked").length;
+}
+
+function updateRetryButton() {
+  const count = getSelectedErrorCount();
+  const total = errorsList.querySelectorAll(".e-check").length;
+  if (total === 0) {
+    btnRetry.style.display = "none";
+    return;
+  }
+  btnRetry.textContent = count === total
+    ? `Retry All Errors (${total})`
+    : `Retry Selected (${count}/${total})`;
+  btnRetry.disabled = count === 0;
 }
 
 // ── Restore sync state from previous session ─────────────────────────────────
@@ -143,15 +203,12 @@ chrome.runtime.sendMessage({ type: "get-sync-state" }, (state) => {
     });
   }
 
-  // Show retry button if there are errored items and sync is not running.
+  // Render errored items list (also shows/hides retry + dismiss buttons via updateRetryButton).
+  renderErroredItems(state.erroredItems);
   if (!state.running && state.erroredItems && state.erroredItems.length > 0) {
-    btnRetry.textContent = `Retry Errors (${state.erroredItems.length})`;
     btnRetry.style.display = "block";
     btnDismissErrors.style.display = "block";
   }
-
-  // Render errored items list.
-  renderErroredItems(state.erroredItems);
 
   // Show primary sync buttons if sync is not running.
   if (!state.running) {
@@ -211,15 +268,14 @@ chrome.runtime.onMessage.addListener((msg) => {
     // Show retry button and errored items list if there are errored items.
     chrome.runtime.sendMessage({ type: "get-sync-state" }, (state) => {
       if (chrome.runtime.lastError || !state) return;
+      renderErroredItems(state.erroredItems);
       if (state.erroredItems && state.erroredItems.length > 0) {
-        btnRetry.textContent = `Retry Errors (${state.erroredItems.length})`;
         btnRetry.style.display = "block";
         btnDismissErrors.style.display = "block";
       } else {
         btnRetry.style.display = "none";
         btnDismissErrors.style.display = "none";
       }
-      renderErroredItems(state.erroredItems);
     });
   }
 });
@@ -307,6 +363,20 @@ btnResume.addEventListener("click", () => {
 // ── Retry errors button click handler ────────────────────────────────────────
 
 btnRetry.addEventListener("click", () => {
+  // Collect selected errored items.
+  const selectedItems = [];
+  errorsList.querySelectorAll(".error-item").forEach((div) => {
+    const cb = div.querySelector(".e-check");
+    if (cb && cb.checked) {
+      selectedItems.push({
+        platform: div.dataset.platform,
+        id: div.dataset.itemId,
+      });
+    }
+  });
+
+  if (selectedItems.length === 0) return;
+
   clearLogs();
   errorsSection.style.display = "none";
   btnRetry.style.display = "none";
@@ -315,8 +385,18 @@ btnRetry.addEventListener("click", () => {
   btnSync.style.display = "none";
   btnFullSync.style.display = "none";
   btnStop.style.display = "block";
-  log("Retrying errored items...");
-  chrome.runtime.sendMessage({ type: "retry-errors" });
+
+  const total = errorsList.querySelectorAll(".e-check").length;
+  if (selectedItems.length < total) {
+    log(`Retrying ${selectedItems.length} of ${total} errored items...`);
+  } else {
+    log("Retrying all errored items...");
+  }
+
+  chrome.runtime.sendMessage({
+    type: "retry-errors",
+    selectedKeys: selectedItems.map((i) => `${i.platform}:${i.id}`),
+  });
 });
 
 // ── Dismiss errors button click handler ─────────────────────────────────────
@@ -326,6 +406,16 @@ btnDismissErrors.addEventListener("click", () => {
   btnRetry.style.display = "none";
   btnDismissErrors.style.display = "none";
   errorsSection.style.display = "none";
+});
+
+// ── Export sold CSV ──────────────────────────────────────────────────────────
+
+btnExportCsv.addEventListener("click", () => {
+  btnExportCsv.disabled = true;
+  btnExportCsv.textContent = "Starting export...";
+  chrome.runtime.sendMessage({ type: "export-sold-csv" });
+  log("Exporting sold listings from Crosslist...");
+  // Button re-enables when popup reopens (it closes when Crosslist tab activates).
 });
 
 // ── Tab switching ────────────────────────────────────────────────────────────

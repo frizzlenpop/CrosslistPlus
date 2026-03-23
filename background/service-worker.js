@@ -134,6 +134,7 @@ async function fetchVintedSales(userId, latestOnly = false) {
               title:    item.title || "(untitled)",
               sku:      "",
               status:   deriveVintedStatus(item),
+              saleDate: "", // Wardrobe API doesn't include sale date.
             });
             seenTitles.add((item.title || "").toLowerCase().trim());
           }
@@ -220,6 +221,7 @@ async function fetchVintedSales(userId, latestOnly = false) {
                     title:    bi.title || "(untitled)",
                     sku:      "",
                     status:   "sold",
+                    saleDate: order.date || "",
                   });
                   seenTitles.add(biTitle);
                   bundleCount++;
@@ -245,6 +247,7 @@ async function fetchVintedSales(userId, latestOnly = false) {
             title:    order.title || "(untitled)",
             sku:      "",
             status:   "sold",
+            saleDate: order.date || "",
           });
           seenTitles.add(titleKey);
           orderCount++;
@@ -364,6 +367,7 @@ async function fetchEbayCancelled() {
 
   let tabId = null;
   let usedDomain = null;
+  let createdTab = false;
 
   // Re-use an existing eBay Seller Hub tab if one is already open.
   for (const domain of domains) {
@@ -382,6 +386,7 @@ async function fetchEbayCancelled() {
       active: false,
     });
     tabId = newTab.id;
+    createdTab = true;
     await waitForTabLoad(tabId);
   }
 
@@ -400,6 +405,11 @@ async function fetchEbayCancelled() {
     }));
   } catch (err) {
     return [];
+  } finally {
+    // Clean up: close the tab if we created it to avoid tab leak.
+    if (createdTab) {
+      try { await chrome.tabs.remove(tabId); } catch (_) {}
+    }
   }
 }
 
@@ -447,6 +457,7 @@ async function fetchEbaySales(latestOnly = false) {
   // Try to find an existing eBay Seller Hub tab, or open one.
   let tabId = null;
   let usedDomain = null;
+  let createdTab = false;
 
   for (const domain of domains) {
     const tabs = await chrome.tabs.query({ url: `*://${domain}/sh/ord*` });
@@ -466,6 +477,7 @@ async function fetchEbaySales(latestOnly = false) {
       active: false,
     });
     tabId = newTab.id;
+    createdTab = true;
     await waitForTabLoad(tabId);
   }
 
@@ -518,6 +530,11 @@ async function fetchEbaySales(latestOnly = false) {
     seen.add(key);
     return true;
   });
+
+  // Clean up: close the tab if we created it to avoid tab leak.
+  if (createdTab) {
+    try { await chrome.tabs.remove(tabId); } catch (_) {}
+  }
 
   if (allItems.length > 0) {
     emitLog(`eBay (${usedDomain}): found ${allItems.length} item(s) total.`, "ok");
@@ -671,12 +688,30 @@ function scrapeEbayOrdersDOM(defaultStatus) {
       }
     }
 
+    // Sale date: look for a cell containing a recognizable date string.
+    // eBay Seller Hub typically shows dates like "Mar 15, 2026" or "15 Mar 2026".
+    let saleDate = "";
+    const dateCells = row.querySelectorAll("td");
+    const DATE_REGEX = /\b(\d{1,2}\s+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\w*\s+\d{4}|(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\w*\s+\d{1,2},?\s+\d{4})\b/i;
+    for (const cell of dateCells) {
+      const match = cell.textContent.trim().match(DATE_REGEX);
+      if (match) {
+        // Try to parse it into an ISO date string.
+        const parsed = new Date(match[1]);
+        if (!isNaN(parsed.getTime())) {
+          saleDate = parsed.toISOString();
+        }
+        break;
+      }
+    }
+
     items.push({
       platform: "ebay",
       id: itemNum || orderId,
       title,
       sku,
       status: defaultStatus,
+      saleDate,
     });
   }
 
@@ -684,34 +719,168 @@ function scrapeEbayOrdersDOM(defaultStatus) {
 }
 
 /**
+ * This function runs inside the Crosslist tab's page context.
+ * It calls the Crosslist API to fetch all sold listings and downloads a CSV.
+ *
+ * Passed as the `func` argument to chrome.scripting.executeScript.
+ */
+async function exportSoldCSVInPage() {
+  // Show a floating overlay for progress feedback.
+  let overlay = document.getElementById("__inventorysync-export-overlay");
+  if (!overlay) {
+    overlay = document.createElement("div");
+    overlay.id = "__inventorysync-export-overlay";
+    overlay.style.cssText =
+      "position:fixed;bottom:20px;right:20px;background:#1a1d27;color:#e2e4e9;" +
+      "padding:12px 20px;border-radius:8px;font-family:system-ui;font-size:14px;" +
+      "z-index:99999;box-shadow:0 4px 12px rgba(0,0,0,0.5);border:1px solid #2a2d3a;" +
+      "transition:border-color 0.3s;";
+    document.body.appendChild(overlay);
+  }
+  overlay.textContent = "Fetching sold listings...";
+
+  try {
+    const PER_PAGE = 500;
+    let page = 1;
+    let allRows = [];
+    let totalRecords = 0;
+
+    while (true) {
+      const res = await fetch("/api/Product/GetProducts", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        credentials: "include",
+        body: JSON.stringify({
+          columnFilters: {
+            listedOn: [], notListedOn: [], origin: [], internalTags: [],
+            createdBetween: null, updatedBetween: null, lastListedBetween: null,
+            brands: [], category: null, condition: null, isNotImported: false,
+            soldStatus: "Sold",
+          },
+          advancedFilters: { groups: [] },
+          sort: { field: "sold", type: "desc" },
+          page,
+          perPage: PER_PAGE,
+          search: "",
+        }),
+      });
+
+      if (!res.ok) throw new Error("API returned " + res.status);
+
+      const data = await res.json();
+      totalRecords = data.totalRecords || 0;
+      const rows = data.rows || [];
+      allRows.push(...rows);
+
+      overlay.textContent = "Fetched " + allRows.length + " / " + totalRecords + " sold listings...";
+
+      if (rows.length < PER_PAGE) break;
+      page++;
+      if (page > 100) break;
+    }
+
+    if (allRows.length === 0) {
+      overlay.textContent = "No sold listings found.";
+      overlay.style.borderColor = "#eab308";
+      setTimeout(() => overlay.remove(), 4000);
+      return { count: 0 };
+    }
+
+    // CSV escape helper.
+    function esc(value) {
+      const str = String(value == null ? "" : value);
+      if (str.includes('"') || str.includes(",") || str.includes("\n")) {
+        return '"' + str.replace(/"/g, '""') + '"';
+      }
+      return str;
+    }
+
+    // Build CSV.
+    const header = "SKU,Title,Price,Brand,Condition,Category,Created,Sold Date,Origin,Listed On,Labels";
+    const csvLines = [header];
+
+    for (const row of allRows) {
+      const marketplaces = (row.postedToMarketplaces || []).map(function(m) { return m.marketplace; }).join("; ");
+      const labels = (row.internalTags || []).map(function(t) { return t.value; }).join("; ");
+
+      csvLines.push([
+        esc(row.sku), esc(row.title), esc(row.price), esc(row.brand),
+        esc(row.condition), esc(row.category), esc(row.created), esc(row.sold),
+        esc(row.importedFrom), esc(marketplaces), esc(labels),
+      ].join(","));
+    }
+
+    // Trigger download.
+    const csvContent = csvLines.join("\n");
+    const blob = new Blob([csvContent], { type: "text/csv;charset=utf-8;" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = "crosslist-sold-" + new Date().toISOString().slice(0, 10) + ".csv";
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+
+    overlay.textContent = "Exported " + allRows.length + " sold listing(s) to CSV!";
+    overlay.style.borderColor = "#22c55e";
+    setTimeout(function() { overlay.remove(); }, 5000);
+    return { count: allRows.length };
+
+  } catch (err) {
+    overlay.textContent = "Export failed: " + err.message;
+    overlay.style.borderColor = "#ef4444";
+    setTimeout(function() { overlay.remove(); }, 5000);
+    return { error: err.message };
+  }
+}
+
+/**
  * Wait for a tab to finish loading.
- * Checks current tab status first to avoid hanging if already loaded.
+ * Listener is added BEFORE checking current status to avoid a race
+ * where the tab completes between the status check and listener setup.
  * @param {number} tabId
  * @param {number} [timeout=30000]
  * @returns {Promise<void>}
  */
 function waitForTabLoad(tabId, timeout = 30000) {
   return new Promise((resolve, reject) => {
-    // Check if the tab is already loaded.
+    let resolved = false;
+
+    const done = () => {
+      if (resolved) return;
+      resolved = true;
+      clearTimeout(timer);
+      chrome.tabs.onUpdated.removeListener(listener);
+      resolve();
+    };
+
+    const timer = setTimeout(() => {
+      if (resolved) return;
+      resolved = true;
+      chrome.tabs.onUpdated.removeListener(listener);
+      reject(new Error(`Tab ${tabId} did not finish loading within ${timeout}ms`));
+    }, timeout);
+
+    // Add listener FIRST — before checking current status — to avoid
+    // missing the "complete" event if it fires between get() and addListener().
+    const listener = (id, info) => {
+      if (id === tabId && info.status === "complete") done();
+    };
+    chrome.tabs.onUpdated.addListener(listener);
+
+    // Now check if already loaded.
     chrome.tabs.get(tabId, (tab) => {
-      if (tab && tab.status === "complete") {
-        resolve();
-        return;
-      }
-
-      const timer = setTimeout(() => {
-        chrome.tabs.onUpdated.removeListener(listener);
-        reject(new Error(`Tab ${tabId} did not finish loading within ${timeout}ms`));
-      }, timeout);
-
-      const listener = (id, info) => {
-        if (id === tabId && info.status === "complete") {
+      if (chrome.runtime.lastError) {
+        if (!resolved) {
+          resolved = true;
           clearTimeout(timer);
           chrome.tabs.onUpdated.removeListener(listener);
-          resolve();
+          reject(new Error(`Tab ${tabId} not found: ${chrome.runtime.lastError.message}`));
         }
-      };
-      chrome.tabs.onUpdated.addListener(listener);
+        return;
+      }
+      if (tab && tab.status === "complete") done();
     });
   });
 }
@@ -813,6 +982,73 @@ function buildRecentHistoryKeys(syncHistory) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Core sync function — used by both the message handler and the alarm handler.
+// Extracted so it can be called directly (alarm) or via message (popup).
+// ─────────────────────────────────────────────────────────────────────────────
+
+async function performSync({ platforms, vintedUserId, mode, dryRun }) {
+  if (syncState.running) {
+    emitLog("Sync already in progress — ignoring duplicate request.", "warn");
+    return;
+  }
+  try {
+    syncState = { running: true, found: 0, synced: 0, errors: 0, logs: [], pendingItems: [], erroredItems: [] };
+    saveNow();
+
+    const latestOnly = mode !== "full";
+    let allItems = [];
+
+    const jobs = [];
+    if (platforms.vinted) jobs.push(fetchVintedSales(vintedUserId, latestOnly));
+    if (platforms.ebay)   jobs.push(fetchEbaySales(latestOnly));
+
+    const results = await Promise.allSettled(jobs);
+    for (const r of results) {
+      if (r.status === "fulfilled") allItems.push(...r.value);
+    }
+
+    allItems = dedup(allItems);
+    emitCounts({ found: allItems.length });
+    emitLog(`Total unique items: ${allItems.length}`);
+
+    if (allItems.length === 0) {
+      emitLog("Nothing to sync.", "warn");
+      syncState.running = false;
+      saveNow();
+      chrome.runtime.sendMessage({ type: "sync-done", completed: true }).catch(() => {});
+      return;
+    }
+
+    const { syncHistory = [] } = await chrome.storage.local.get({ syncHistory: [] });
+    const historyKeys = buildRecentHistoryKeys(syncHistory);
+    const newItems = allItems.filter((i) => !historyKeys.has(`${i.platform}:${i.id}`));
+    const skipped = allItems.length - newItems.length;
+
+    if (skipped > 0) {
+      emitLog(`Skipped ${skipped} item(s) already synced (within last 30 days).`, "info");
+    }
+
+    if (newItems.length === 0) {
+      emitLog("All items already synced. Nothing to do.", "ok");
+      syncState.running = false;
+      saveNow();
+      chrome.runtime.sendMessage({ type: "sync-done", completed: true }).catch(() => {});
+      return;
+    }
+
+    syncState.pendingItems = newItems;
+    saveNow();
+    emitLog(`${newItems.length} item(s) to process.`);
+    await sendToCrosslist(newItems, dryRun);
+  } catch (err) {
+    emitLog(`Fatal error: ${err.message}`, "error");
+    syncState.running = false;
+    saveNow();
+    chrome.runtime.sendMessage({ type: "sync-done", completed: false }).catch(() => {});
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Consolidated message listener — handles ALL messages from popup and content
 // scripts in one place to avoid listener ordering and return-value conflicts.
 // ─────────────────────────────────────────────────────────────────────────────
@@ -853,7 +1089,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
       const already = syncState.erroredItems.some((i) => `${i.platform}:${i.id}` === key);
       if (!already) {
         syncState.erroredItems.push(msg.item);
-        scheduleSave();
+        saveNow(); // Critical: persist immediately so errors survive worker restart.
       }
     }
     return;
@@ -863,6 +1099,16 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   if (msg.type === "sync-history-entry") {
     const entry = msg.entry;
     if (entry) {
+      // Shrink pendingItems as each item is successfully processed.
+      syncState.pendingItems = syncState.pendingItems.filter(
+        (i) => !(i.platform === entry.platform && i.id === entry.id)
+      );
+      // Also remove from erroredItems if it was previously errored and now succeeded.
+      syncState.erroredItems = syncState.erroredItems.filter(
+        (i) => !(i.platform === entry.platform && i.id === entry.id)
+      );
+      saveNow();
+
       chrome.storage.local.get({ syncHistory: [] }, (data) => {
         const history = data.syncHistory;
         history.push(entry);
@@ -902,67 +1148,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   if (msg.type === "start-sync") {
     (async () => {
       await stateReady;
-      if (syncState.running) {
-        emitLog("Sync already in progress — ignoring duplicate request.", "warn");
-        sendResponse?.({ ok: false, reason: "busy" });
-        return;
-      }
-      try {
-        syncState = { running: true, found: 0, synced: 0, errors: 0, logs: [], pendingItems: [], erroredItems: [] };
-        saveNow();
-
-        const { platforms, vintedUserId, mode, dryRun } = msg;
-        const latestOnly = mode !== "full";
-        let allItems = [];
-
-        const jobs = [];
-        if (platforms.vinted) jobs.push(fetchVintedSales(vintedUserId, latestOnly));
-        if (platforms.ebay)   jobs.push(fetchEbaySales(latestOnly));
-
-        const results = await Promise.allSettled(jobs);
-        for (const r of results) {
-          if (r.status === "fulfilled") allItems.push(...r.value);
-        }
-
-        allItems = dedup(allItems);
-        emitCounts({ found: allItems.length });
-        emitLog(`Total unique items: ${allItems.length}`);
-
-        if (allItems.length === 0) {
-          emitLog("Nothing to sync.", "warn");
-          syncState.running = false;
-          saveNow();
-          chrome.runtime.sendMessage({ type: "sync-done", completed: true }).catch(() => {});
-          return;
-        }
-
-        const { syncHistory = [] } = await chrome.storage.local.get({ syncHistory: [] });
-        const historyKeys = buildRecentHistoryKeys(syncHistory);
-        const newItems = allItems.filter((i) => !historyKeys.has(`${i.platform}:${i.id}`));
-        const skipped = allItems.length - newItems.length;
-
-        if (skipped > 0) {
-          emitLog(`Skipped ${skipped} item(s) already synced (within last 30 days).`, "info");
-        }
-
-        if (newItems.length === 0) {
-          emitLog("All items already synced. Nothing to do.", "ok");
-          syncState.running = false;
-          saveNow();
-          chrome.runtime.sendMessage({ type: "sync-done", completed: true }).catch(() => {});
-          return;
-        }
-
-        syncState.pendingItems = newItems;
-        saveNow();
-        emitLog(`${newItems.length} item(s) to process.`);
-        await sendToCrosslist(newItems, dryRun);
-      } catch (err) {
-        emitLog(`Fatal error: ${err.message}`, "error");
-        syncState.running = false;
-        saveNow();
-        chrome.runtime.sendMessage({ type: "sync-done", completed: false }).catch(() => {});
-      }
+      await performSync(msg);
     })();
     return true;
   }
@@ -1052,6 +1238,39 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     return true;
   }
 
+  // ── Export sold CSV ──
+  if (msg.type === "export-sold-csv") {
+    (async () => {
+      try {
+        const tabs = await chrome.tabs.query({ url: "*://app.crosslist.com/*" });
+        let tabId;
+        if (tabs.length > 0) {
+          tabId = tabs[0].id;
+          await chrome.tabs.update(tabId, { active: true });
+        } else {
+          const newTab = await chrome.tabs.create({ url: "https://app.crosslist.com", active: true });
+          tabId = newTab.id;
+          await waitForTabLoad(tabId);
+          await new Promise((r) => setTimeout(r, 3000));
+        }
+        // Inject the export function directly — no dependency on content script.
+        const results = await chrome.scripting.executeScript({
+          target: { tabId },
+          func: exportSoldCSVInPage,
+        });
+        const result = results?.[0]?.result;
+        if (result && result.error) {
+          emitLog(`Export failed: ${result.error}`, "error");
+        } else if (result) {
+          emitLog(`Exported ${result.count} sold listing(s) to CSV.`, "ok");
+        }
+      } catch (err) {
+        emitLog(`Export failed: ${err.message}`, "error");
+      }
+    })();
+    return true;
+  }
+
   // ── Resume sync ──
   if (msg.type === "resume-sync") {
     (async () => {
@@ -1104,7 +1323,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     (async () => {
       await stateReady;
       try {
-        const items = syncState.erroredItems || [];
+        let items = syncState.erroredItems || [];
         if (items.length === 0) {
           emitLog("No errored items to retry.", "warn");
           syncState.running = false;
@@ -1113,12 +1332,18 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
           return;
         }
 
+        // If the popup sent a selectedKeys list, only retry those items.
+        if (msg.selectedKeys && msg.selectedKeys.length > 0) {
+          const selectedSet = new Set(msg.selectedKeys);
+          items = items.filter((i) => selectedSet.has(`${i.platform}:${i.id}`));
+        }
+
         // Filter out items that were manually resolved (now in syncHistory).
         const { syncHistory = [] } = await chrome.storage.local.get({ syncHistory: [] });
         const historyKeys = buildRecentHistoryKeys(syncHistory);
         const remaining = items.filter((i) => !historyKeys.has(`${i.platform}:${i.id}`));
 
-        // Bug #7: Keep erroredItems until sync-done with completed:true confirms
+        // Keep all erroredItems until sync-done with completed:true confirms
         // everything finished — prevents item loss if user stops mid-retry.
         const retryItems = [...remaining];
         syncState = {
@@ -1128,12 +1353,12 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
           errors: 0,
           logs: [],
           pendingItems: retryItems,
-          erroredItems: retryItems, // Keep until completed.
+          erroredItems: syncState.erroredItems, // Keep full list until completed.
         };
         saveNow();
 
         if (remaining.length === 0) {
-          emitLog("All errored items have since been resolved.", "ok");
+          emitLog("All selected errored items have since been resolved.", "ok");
           syncState.running = false;
           syncState.erroredItems = [];
           saveNow();
@@ -1160,13 +1385,13 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
 // ─────────────────────────────────────────────────────────────────────────────
 
 const AUTO_SYNC_ALARM = "auto-sync";
-const AUTO_SYNC_DEFAULT_MINUTES = 30;
 
 // Set up or tear down the alarm based on the stored setting.
 async function applyAutoSyncSetting() {
-  const { autoSync } = await chrome.storage.local.get({ autoSync: false });
+  const { autoSync, autoSyncMinutes } = await chrome.storage.local.get({ autoSync: false, autoSyncMinutes: 30 });
   if (autoSync) {
-    chrome.alarms.create(AUTO_SYNC_ALARM, { periodInMinutes: AUTO_SYNC_DEFAULT_MINUTES });
+    const minutes = parseInt(autoSyncMinutes, 10) || 30;
+    chrome.alarms.create(AUTO_SYNC_ALARM, { periodInMinutes: minutes });
   } else {
     chrome.alarms.clear(AUTO_SYNC_ALARM);
   }
@@ -1175,22 +1400,23 @@ async function applyAutoSyncSetting() {
 // Apply on startup.
 applyAutoSyncSetting();
 
-// Re-apply whenever the setting changes (e.g. user toggles in popup).
+// Re-apply whenever the setting or interval changes (e.g. user toggles in popup).
 chrome.storage.onChanged.addListener((changes) => {
-  if (changes.autoSync) applyAutoSyncSetting();
+  if (changes.autoSync || changes.autoSyncMinutes) applyAutoSyncSetting();
 });
 
 chrome.alarms.onAlarm.addListener(async (alarm) => {
   if (alarm.name !== AUTO_SYNC_ALARM) return;
+  await stateReady;
   // Only fire if not already syncing.
   if (syncState.running) return;
   const { vintedUserId, autoSync } = await chrome.storage.local.get(["vintedUserId", "autoSync"]);
   if (!autoSync || !vintedUserId) return;
-  // Trigger a "latest" sync for both platforms.
-  chrome.runtime.sendMessage({
-    type: "start-sync",
+  // Call performSync directly — sendMessage doesn't reach the same service worker.
+  await performSync({
     mode: "latest",
     platforms: { vinted: true, ebay: true },
     vintedUserId,
-  }).catch(() => {});
+    dryRun: false,
+  });
 });
